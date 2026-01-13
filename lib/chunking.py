@@ -69,6 +69,10 @@ def chunk_markdown_by_headers(md_text: str, max_size: int = 4000, min_size: int 
         level = len(match.group(1))  # Count # symbols
         header_text = match.group(2).strip()
 
+        # Clean markdown artifacts from headers (MinerU often preserves **bold** in headers)
+        header_text = header_text.replace('**', '').replace('*', '').replace('__', '').replace('_', ' ')
+        header_text = re.sub(r'\s+', ' ', header_text).strip()  # Normalize whitespace
+
         # Get content between this header and the next (or end of document)
         start_pos = match.end()
         if i + 1 < len(headers):

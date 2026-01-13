@@ -75,31 +75,89 @@ def extract_with_mineru(pdf_path: str, output_dir: str) -> Optional[str]:
     return md_content
 
 
-def extract_text(pdf_path: Path) -> tuple[Optional[str], str]:
+def detect_two_column(text: str) -> bool:
     """
-    Extract text from PDF, trying fast method first, then MinerU.
+    Heuristic to detect two-column layout problems.
+
+    Signs of fitz misreading two-column PDFs:
+    - Very short lines followed by very short lines
+    - Repeated patterns of truncated sentences
+    """
+    lines = text.split('\n')
+    if len(lines) < 20:
+        return False
+
+    # Check for suspiciously short average line length
+    line_lengths = [len(line.strip()) for line in lines[:100] if line.strip()]
+    if not line_lengths:
+        return False
+
+    avg_length = sum(line_lengths) / len(line_lengths)
+
+    # Two-column misreads often have avg line length < 50 chars
+    # and lots of lines ending mid-word
+    if avg_length < 50:
+        # Count lines ending with lowercase letter (mid-word break)
+        mid_word_breaks = sum(1 for line in lines[:100]
+                            if line.strip() and line.strip()[-1].islower())
+        if mid_word_breaks > 30:
+            return True
+
+    return False
+
+
+def extract_text(pdf_path: Path, prefer_mineru: bool = True) -> tuple[Optional[str], str]:
+    """
+    Extract text from PDF.
+
+    For SCIENTIFIC PAPERS: Use MinerU first (preserves structure, handles 2-column).
+    Fitz is only used as fallback when MinerU fails.
+
+    Args:
+        pdf_path: Path to PDF file
+        prefer_mineru: If True, try MinerU first (recommended for papers)
 
     Returns:
         (text_content, extraction_method)
     """
-    # Try fast extraction first
-    text = extract_with_fitz(str(pdf_path))
-    if text:
-        return text, "fitz"
+    if prefer_mineru:
+        # SCIENTIFIC PAPERS: MinerU first for proper structure preservation
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                text = extract_with_mineru(str(pdf_path), tmpdir)
+                if text and len(text.strip()) > 500:
+                    return text, "mineru"
+        except Exception as e:
+            print(f"(MinerU failed: {e}, trying fitz)", end=" ", flush=True)
 
-    # Fall back to MinerU for complex layouts
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            text = extract_with_mineru(str(pdf_path), tmpdir)
-            if text:
-                return text, "mineru"
-    except Exception as e:
-        print(f"MinerU extraction failed: {e}")
+        # Fallback to fitz only if MinerU fails
+        text = extract_with_fitz(str(pdf_path))
+        if text:
+            # Validate fitz output isn't garbage from 2-column misread
+            if detect_two_column(text):
+                print("(fitz 2-column garbage detected)", end=" ", flush=True)
+                return None, "failed"
+            return text, "fitz"
+    else:
+        # Fast mode: Try fitz first (use for known simple PDFs)
+        text = extract_with_fitz(str(pdf_path))
+        if text and not detect_two_column(text):
+            return text, "fitz"
+
+        # Fall back to MinerU
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                text = extract_with_mineru(str(pdf_path), tmpdir)
+                if text:
+                    return text, "mineru"
+        except Exception as e:
+            print(f"MinerU extraction failed: {e}")
 
     return None, "failed"
 
 
 def store_to_postgres(
+    conn,  # Connection passed in - no per-PDF overhead
     doc_id: str,
     metadata: PaperMetadata,
     chunks: List[Chunk],
@@ -109,14 +167,15 @@ def store_to_postgres(
     """
     Store document and passages to Postgres with pgvector.
 
+    Args:
+        conn: Postgres connection (managed by caller for pooling)
+
     Schema:
     - documents: Metadata (title, authors, DOI, etc.)
     - passages_v2: Chunks with embeddings
     """
-    import psycopg2
     from psycopg2.extras import execute_values
 
-    conn = psycopg2.connect(config.POSTGRES_URI)
     cur = conn.cursor()
 
     try:
@@ -169,57 +228,56 @@ def store_to_postgres(
         raise e
     finally:
         cur.close()
-        conn.close()
+        # NOTE: Don't close conn here - caller manages the connection pool
 
 
-def store_to_neo4j(doc_id: str, metadata: PaperMetadata, chunks: List[Chunk]):
+def store_to_neo4j_pooled(driver, doc_id: str, metadata: PaperMetadata, chunks: List[Chunk]):
     """
     Store paper and concepts to Neo4j knowledge graph.
+
+    Args:
+        driver: Neo4j driver instance (managed by caller for pooling)
     """
-    from neo4j import GraphDatabase
+    with driver.session() as session:
+        # Create Paper node
+        session.run("""
+            MERGE (p:Paper {doc_id: $doc_id})
+            SET p.title = $title,
+                p.year = $year,
+                p.doi = $doi,
+                p.source = 'ingest_v2'
+        """, {
+            'doc_id': doc_id,
+            'title': metadata.title,
+            'year': metadata.year,
+            'doi': metadata.doi
+        })
 
-    driver = GraphDatabase.driver(
-        config.NEO4J_URI,
-        auth=(config.NEO4J_USER, config.NEO4J_PASSWORD)
-    )
-
-    try:
-        with driver.session() as session:
-            # Create Paper node
+        # Create section nodes and relationships
+        for chunk in chunks:
             session.run("""
-                MERGE (p:Paper {doc_id: $doc_id})
-                SET p.title = $title,
-                    p.year = $year,
-                    p.doi = $doi,
-                    p.source = 'ingest_v2'
+                MATCH (p:Paper {doc_id: $doc_id})
+                MERGE (s:Section {paper_id: $doc_id, header: $header})
+                SET s.level = $level, s.parent = $parent
+                MERGE (p)-[:HAS_SECTION]->(s)
             """, {
                 'doc_id': doc_id,
-                'title': metadata.title,
-                'year': metadata.year,
-                'doi': metadata.doi
+                'header': chunk.header,
+                'level': chunk.level,
+                'parent': chunk.parent_header
             })
 
-            # Create section nodes and relationships
-            for chunk in chunks:
-                session.run("""
-                    MATCH (p:Paper {doc_id: $doc_id})
-                    MERGE (s:Section {paper_id: $doc_id, header: $header})
-                    SET s.level = $level, s.parent = $parent
-                    MERGE (p)-[:HAS_SECTION]->(s)
-                """, {
-                    'doc_id': doc_id,
-                    'header': chunk.header,
-                    'level': chunk.level,
-                    'parent': chunk.parent_header
-                })
 
-    finally:
-        driver.close()
-
-
-def process_pdf(pdf_path: Path, embedder) -> dict:
+def process_pdf(pdf_path: Path, embedder, pg_conn, neo4j_driver, dry_run: bool = False) -> dict:
     """
     Process a single PDF through the full V2 pipeline.
+
+    Args:
+        pdf_path: Path to PDF file
+        embedder: BGE-M3 embedder instance
+        pg_conn: Postgres connection (pooled)
+        neo4j_driver: Neo4j driver instance (pooled)
+        dry_run: If True, extract and chunk only, don't store
 
     Returns:
         Dict with processing results
@@ -238,9 +296,9 @@ def process_pdf(pdf_path: Path, embedder) -> dict:
     result['confidence'] = metadata.confidence
     print(f"[{metadata.source_method}] confidence={metadata.confidence:.2f}")
 
-    # Step 2: Extract text (fitz or MinerU)
+    # Step 2: Extract text (MinerU first for scientific papers)
     print(f"  [2/4] Extracting text...", end=" ", flush=True)
-    text, method = extract_text(pdf_path)
+    text, method = extract_text(pdf_path, prefer_mineru=True)
     result['method'] = method
 
     if not text:
@@ -270,12 +328,16 @@ def process_pdf(pdf_path: Path, embedder) -> dict:
     embeddings = embedder.encode(chunk_texts, batch_size=16)
     print(f"{embeddings.shape}")
 
-    # Step 5: Store to databases
+    if dry_run:
+        result['status'] = 'dry_run'
+        return result
+
+    # Step 5: Store to databases (using pooled connections)
     doc_id = hashlib.sha256(pdf_path.name.encode()).hexdigest()[:16]
 
     try:
-        store_to_postgres(doc_id, metadata, chunks, embeddings, pdf_path)
-        store_to_neo4j(doc_id, metadata, chunks)
+        store_to_postgres(pg_conn, doc_id, metadata, chunks, embeddings, pdf_path)
+        store_to_neo4j_pooled(neo4j_driver, doc_id, metadata, chunks)
         result['status'] = 'success'
     except Exception as e:
         result['status'] = 'partial'
@@ -290,6 +352,7 @@ def main():
     parser.add_argument("path", help="PDF file or directory to ingest")
     parser.add_argument("--dry-run", action="store_true", help="Extract and chunk only, don't store")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of PDFs to process")
+    parser.add_argument("--fast", action="store_true", help="Try fitz first (for simple PDFs)")
     args = parser.parse_args()
 
     path = Path(args.path)
@@ -310,34 +373,64 @@ def main():
     print("=" * 60)
     print(f"Model: {config.EMBEDDING_MODEL} ({config.EMBEDDING_DIM} dim)")
     print(f"PDFs: {len(pdfs)}")
+    print(f"Mode: {'fast (fitz first)' if args.fast else 'quality (MinerU first)'}")
+    print(f"Dry run: {args.dry_run}")
     print("=" * 60)
 
     # Load embedder once
     embedder = get_embedder()
 
-    stats = {'success': 0, 'failed': 0, 'partial': 0, 'total_chunks': 0}
+    # Initialize database connections ONCE (connection pooling)
+    import psycopg2
+    from neo4j import GraphDatabase
 
-    for i, pdf in enumerate(pdfs, 1):
-        print(f"\n[{i}/{len(pdfs)}] {pdf.name}")
+    pg_conn = None
+    neo4j_driver = None
 
-        try:
-            result = process_pdf(pdf, embedder)
-            stats[result['status']] = stats.get(result['status'], 0) + 1
-            stats['total_chunks'] += result['chunks']
-            print(f"  → {result['status'].upper()}")
-        except Exception as e:
-            print(f"  → ERROR: {e}")
-            stats['failed'] += 1
+    if not args.dry_run:
+        print("Connecting to databases...")
+        pg_conn = psycopg2.connect(config.POSTGRES_URI)
+        neo4j_driver = GraphDatabase.driver(
+            config.NEO4J_URI,
+            auth=(config.NEO4J_USER, config.NEO4J_PASSWORD)
+        )
+        print("  Postgres: connected")
+        print("  Neo4j: connected")
 
-        gc.collect()
+    stats = {'success': 0, 'failed': 0, 'partial': 0, 'dry_run': 0, 'total_chunks': 0}
+
+    try:
+        for i, pdf in enumerate(pdfs, 1):
+            print(f"\n[{i}/{len(pdfs)}] {pdf.name}")
+
+            try:
+                result = process_pdf(pdf, embedder, pg_conn, neo4j_driver, dry_run=args.dry_run)
+                stats[result['status']] = stats.get(result['status'], 0) + 1
+                stats['total_chunks'] += result['chunks']
+                print(f"  → {result['status'].upper()}")
+            except Exception as e:
+                print(f"  → ERROR: {e}")
+                stats['failed'] += 1
+
+            gc.collect()
+
+    finally:
+        # Clean up connections
+        if pg_conn:
+            pg_conn.close()
+            print("\nPostgres connection closed")
+        if neo4j_driver:
+            neo4j_driver.close()
+            print("Neo4j connection closed")
 
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"Success: {stats['success']}")
-    print(f"Failed:  {stats['failed']}")
-    print(f"Partial: {stats.get('partial', 0)}")
-    print(f"Chunks:  {stats['total_chunks']}")
+    print(f"Success:  {stats['success']}")
+    print(f"Failed:   {stats['failed']}")
+    print(f"Partial:  {stats.get('partial', 0)}")
+    print(f"Dry run:  {stats.get('dry_run', 0)}")
+    print(f"Chunks:   {stats['total_chunks']}")
     print("=" * 60)
 
 
