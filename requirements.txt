@@ -1,0 +1,29 @@
+# Polymath V2 Dependencies
+# Install: pip install -r requirements.txt
+
+# Embeddings - BGE-M3 ONLY
+FlagEmbedding>=1.2.0
+
+# Database
+psycopg2-binary>=2.9.0
+neo4j>=5.0.0
+
+# Zotero
+pyzotero>=1.5.0
+
+# PDF Processing
+PyMuPDF>=1.23.0
+pdf2doi>=1.5.0
+
+# MinerU (optional - for complex PDFs)
+# Uncomment if needed:
+# magic-pdf>=0.6.0
+
+# Utilities
+tqdm>=4.65.0
+numpy>=1.24.0
+requests>=2.28.0
+
+# Development
+pytest>=7.0.0
+black>=23.0.0
