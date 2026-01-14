@@ -285,6 +285,38 @@ class GraphHydrator:
             logger.error(f"Failed to store extraction: {e}")
             raise
 
+    def _record_extraction(
+        self,
+        passage_id: str,
+        extractor_version: str,
+        entity_count: int,
+        relation_count: int
+    ):
+        """
+        Record extraction in Postgres tracking table.
+
+        This enables fast SQL-only filtering via get_unprocessed_passages()
+        instead of the slower Neo4j-based check.
+        """
+        cur = self.pg_conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO passage_extractions
+                    (passage_id, extractor_version, entity_count, relation_count)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (passage_id) DO UPDATE SET
+                    extractor_version = EXCLUDED.extractor_version,
+                    entity_count = EXCLUDED.entity_count,
+                    relation_count = EXCLUDED.relation_count,
+                    extracted_at = NOW()
+            """, (passage_id, extractor_version, entity_count, relation_count))
+            self.pg_conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to record extraction tracking: {e}")
+            self.pg_conn.rollback()
+        finally:
+            cur.close()
+
     def save_checkpoint(self, last_passage_id: str):
         """Save progress checkpoint for resume capability."""
         self.stats.last_checkpoint = last_passage_id
@@ -368,6 +400,15 @@ class GraphHydrator:
 
                 if extraction and extraction.entities:
                     self.store_extraction(extraction, passage['doc_id'])
+
+                    # Track in Postgres for fast SQL-only filtering
+                    if not self.dry_run:
+                        self._record_extraction(
+                            passage['passage_id'],
+                            extraction.extractor_version,
+                            len(extraction.entities),
+                            len(extraction.relations)
+                        )
 
                 self.stats.passages_processed += 1
 
