@@ -139,8 +139,78 @@ Analysis of 6 papers on agentic memory systems yielded 5 actionable improvements
 | `lib/hallucination_detector.py` | HaluMem-style validation | ✅ Complete |
 | `lib/jit_retrieval.py` | GAM-style JIT memory | ✅ Complete |
 | `scripts/ingest_v2.py` | Full ingestion pipeline | ✅ Complete |
+| `scripts/hydrate_graph.py` | Entity extraction → Neo4j bridge | ✅ Complete |
 | `scripts/zotero_upload_v2.py` | Zotero integration | ✅ Complete |
 | `config/schema_v2.sql` | Postgres + pgvector schema | ✅ Complete |
+
+### Integration Flow (The "Hydration" Process)
+
+The system has two phases that must run in sequence:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 1: SKELETON (Text + Vectors)                    │
+│                         Run: ingest_v2.py                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  PDF ──► MinerU ──► Markdown ──► Header Chunking ──► Passages           │
+│                                                                          │
+│  pdf2doi ──► CrossRef/arXiv ──► Metadata                                │
+│                                                                          │
+│  Passages ──► BGE-M3 ──► Embeddings (1024-dim)                          │
+│                                                                          │
+│  OUTPUT: Postgres (documents_v2, passages_v2 with vectors)              │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 2: MUSCLE (Entity Extraction)                   │
+│                         Run: hydrate_graph.py                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Passages ──► Entity Extraction (Pattern + LLM) ──► Validation          │
+│                                                                          │
+│  Validated Entities ──► Neo4j (typed nodes: METHOD, GENE, etc.)         │
+│                                                                          │
+│  Relations ──► Neo4j (APPLIES_TO, PREDICTS, OUTPERFORMS, etc.)          │
+│                                                                          │
+│  OUTPUT: Neo4j knowledge graph with domain-specific schema              │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 3: RETRIEVAL (Query Time)                       │
+│                         Use: jit_retrieval.py                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Query ──► Classification ──► Concept Lookup (Neo4j)                    │
+│                                                                          │
+│  Concepts ──► Document Filter ──► Deep Passage Retrieval (Postgres)     │
+│                                                                          │
+│  Passages ──► Runtime Synthesis (Gemini) ──► Validated Answer           │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Running the Full Pipeline:**
+
+```bash
+# Step 1: Ingest PDFs (creates skeleton)
+python3 scripts/ingest_v2.py /path/to/pdfs/
+
+# Step 2: Hydrate graph (extracts entities)
+python3 scripts/hydrate_graph.py
+
+# Step 3: Query (at runtime)
+python3 -c "
+from lib.jit_retrieval import JITRetriever
+retriever = JITRetriever(pg_conn, neo4j_driver)
+result = retriever.retrieve_sync('What methods predict gene expression from H&E?')
+print(result.synthesis)
+"
+```
 
 ### Database Schema
 
@@ -306,6 +376,61 @@ class ContextCurationPolicy:
 
 **Concept**: Memory-layer architecture for custom embedders handling very long documents.
 
+### 4.5 Additional Relevant Papers in Corpus
+
+Analysis of the Polymath corpus identified additional papers worth incorporating:
+
+#### MCP (Model Context Protocol) Papers
+
+| Paper | Year | Key Insight |
+|-------|------|-------------|
+| MCP-Bench | 2025 | Benchmarks tool-using LLM agents with complex real-world tasks |
+| MCP-Universe | 2025 | Real-world MCP server benchmarks (DOI: 10.48550/arxiv.2508.14704) |
+| MCP-AgentBench | 2025 | Evaluates agent performance with MCP-mediated tools (DOI: 10.48550/arxiv.2509.09734) |
+| Beyond the Protocol | 2025 | Security analysis of MCP ecosystem attack vectors |
+
+**Relevance**: Polymath uses MCP servers for database access. These papers inform:
+- Security hardening of MCP endpoints
+- Benchmarking tool-use performance
+- Best practices for agentic MCP workflows
+
+#### Agentic Workflow Papers
+
+| Paper | Year | Key Insight |
+|-------|------|-------------|
+| Aragog | 2025 | JIT model routing increases throughput 42-217%, reduces latency 32-86% |
+| RobustFlow | 2024 | Robust agentic workflow generation (DOI: 10.48550/arxiv.2509.21834) |
+| AgentScope 1.0 | 2020 | Developer-centric framework for agentic applications |
+| Agentic Design Patterns | 2020 | Foundational patterns for building intelligent agents |
+
+**Aragog Key Insight**: Don't bind agent configurations at request start. Use JIT adaptation:
+- Stage-wise configuration selection
+- System load-aware model routing
+- Fault tolerance through downstream correction
+
+#### Reranking and Retrieval Papers
+
+| Paper | Year | Key Insight |
+|-------|------|-------------|
+| Agentic Rubrics as Verifiers | 2026 | Rubric-based reranking for SWE agents (DOI: 10.48550/arxiv.2601.04171) |
+| RocketQA | 2020 | Optimized training for dense passage retrieval |
+| Unsupervised Corpus Aware Pre-training | 2020 | Language model pre-training for dense retrieval |
+
+**Agentic Rubrics Key Insight**: Structure verification as graded rubrics:
+- Generate context-aware rubric criteria
+- Score candidates against each criterion
+- Aggregate weighted scores for ranking
+
+#### Papers Needing Re-Ingestion
+
+Several important papers have 0 passages (ingestion failed):
+
+| Paper | Year | Action Needed |
+|-------|------|---------------|
+| A Survey on RAG Meeting LLMs | 2020 | Re-ingest with MinerU |
+| Agentic Design Patterns | 2020 | Re-ingest with MinerU |
+| Active Retrieval Augmented Generation | 2020 | Re-ingest with MinerU |
+
 ---
 
 ## 5. Module Reference
@@ -392,6 +517,34 @@ print(f"Passages: {len(result.passages)}")
 print(f"Concepts: {len(result.concepts)}")
 print(f"Synthesis:\n{result.synthesis}")
 ```
+
+### scripts/hydrate_graph.py
+
+**Purpose**: Bridge between ingestion and entity extraction. Populates Neo4j knowledge graph.
+
+```bash
+# Hydrate all unprocessed passages
+python3 scripts/hydrate_graph.py
+
+# Specific document only
+python3 scripts/hydrate_graph.py --doc-id abc123
+
+# Pattern extraction only (no LLM, faster)
+python3 scripts/hydrate_graph.py --no-llm
+
+# Dry run (no database writes)
+python3 scripts/hydrate_graph.py --dry-run --limit 100
+
+# Resume from checkpoint (for long-running jobs)
+python3 scripts/hydrate_graph.py --resume
+```
+
+**Features**:
+- Idempotent (safe to run multiple times)
+- Checkpointing (resume after interruption)
+- HaluMem-style validation before storage
+- Batched processing by document
+- LLM rate limiting
 
 ---
 

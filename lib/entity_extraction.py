@@ -388,52 +388,171 @@ def extract_entities_sync(text: str, passage_id: str = "") -> ExtractionResult:
 # =============================================================================
 
 def store_extraction_to_neo4j(driver, extraction: ExtractionResult, doc_id: str):
-    """Store extracted entities and relations to Neo4j."""
+    """
+    Store extracted entities and relations to Neo4j.
+
+    Creates entity nodes with domain-specific labels (METHOD, GENE, etc.)
+    and links them to Paper nodes via MENTIONED_IN relationships.
+
+    Note: Paper nodes are created by ingest_v2.py. If the Paper doesn't exist,
+    we create a stub node to allow entity storage (it will be enriched later).
+    """
     with driver.session() as session:
+        # Ensure Paper node exists (MERGE creates if missing)
+        session.run("""
+            MERGE (p:Paper {doc_id: $doc_id})
+            ON CREATE SET p.source = 'hydrate_graph', p.created_at = datetime()
+        """, {'doc_id': doc_id})
+
         # Create entity nodes with their types as labels
+        # Note: Using parameterized label requires APOC or separate queries per type
         for entity in extraction.entities:
-            session.run(f"""
-                MERGE (e:{entity.entity_type} {{name: $name}})
-                SET e.confidence = CASE
-                    WHEN e.confidence IS NULL OR $confidence > e.confidence
-                    THEN $confidence ELSE e.confidence END,
-                    e.last_seen = datetime()
-                WITH e
-                MATCH (p:Paper {{doc_id: $doc_id}})
-                MERGE (e)-[:MENTIONED_IN {{
-                    passage_id: $passage_id,
-                    source_text: $source_text,
-                    char_start: $char_start,
-                    char_end: $char_end
-                }}]->(p)
-            """, {
-                'name': entity.name,
-                'confidence': entity.confidence,
-                'doc_id': doc_id,
-                'passage_id': extraction.passage_id,
-                'source_text': entity.source_text,
-                'char_start': entity.char_start,
-                'char_end': entity.char_end
-            })
+            # Validate entity type is in our schema
+            if entity.entity_type not in config.SPATIAL_TX_ENTITY_TYPES:
+                continue
+
+            # Use APOC for dynamic labels if available, otherwise use CASE
+            try:
+                # Try APOC first (preferred)
+                session.run("""
+                    CALL apoc.merge.node([$label], {name: $name}, {
+                        confidence: $confidence,
+                        last_seen: datetime()
+                    }, {}) YIELD node
+                    WITH node
+                    MATCH (p:Paper {doc_id: $doc_id})
+                    MERGE (node)-[r:MENTIONED_IN]->(p)
+                    SET r.passage_id = $passage_id,
+                        r.source_text = $source_text,
+                        r.char_start = $char_start,
+                        r.char_end = $char_end
+                """, {
+                    'label': entity.entity_type,
+                    'name': entity.name,
+                    'confidence': entity.confidence,
+                    'doc_id': doc_id,
+                    'passage_id': extraction.passage_id,
+                    'source_text': entity.source_text,
+                    'char_start': entity.char_start,
+                    'char_end': entity.char_end
+                })
+            except Exception:
+                # Fallback: Use static query per entity type (less elegant but works)
+                _store_entity_static(session, entity, extraction, doc_id)
 
         # Create relations between entities
         for relation in extraction.relations:
-            session.run(f"""
-                MATCH (source {{name: $source_name}})
-                MATCH (target {{name: $target_name}})
-                MERGE (source)-[r:{relation.relation_type}]->(target)
-                SET r.confidence = CASE
-                    WHEN r.confidence IS NULL OR $confidence > r.confidence
-                    THEN $confidence ELSE r.confidence END,
-                    r.evidence = $evidence,
-                    r.passage_id = $passage_id
-            """, {
-                'source_name': relation.source_entity,
-                'target_name': relation.target_entity,
-                'confidence': relation.confidence,
-                'evidence': relation.evidence_text,
-                'passage_id': extraction.passage_id
-            })
+            # Validate relation type
+            if relation.relation_type not in config.SPATIAL_TX_RELATION_TYPES:
+                continue
+
+            try:
+                session.run("""
+                    CALL apoc.merge.relationship(
+                        (MATCH (a {name: $source_name}) RETURN a),
+                        $rel_type,
+                        {passage_id: $passage_id},
+                        {confidence: $confidence, evidence: $evidence},
+                        (MATCH (b {name: $target_name}) RETURN b),
+                        {}
+                    ) YIELD rel
+                    RETURN rel
+                """, {
+                    'source_name': relation.source_entity,
+                    'target_name': relation.target_entity,
+                    'rel_type': relation.relation_type,
+                    'confidence': relation.confidence,
+                    'evidence': relation.evidence_text,
+                    'passage_id': extraction.passage_id
+                })
+            except Exception:
+                # Fallback: static query
+                _store_relation_static(session, relation, extraction)
+
+
+def _store_entity_static(session, entity, extraction, doc_id: str):
+    """Fallback for storing entities without APOC."""
+    # Map entity types to specific queries (verbose but reliable)
+    queries = {
+        'METHOD': "MERGE (e:METHOD {name: $name})",
+        'DATASET': "MERGE (e:DATASET {name: $name})",
+        'CELL_TYPE': "MERGE (e:CELL_TYPE {name: $name})",
+        'GENE': "MERGE (e:GENE {name: $name})",
+        'TISSUE': "MERGE (e:TISSUE {name: $name})",
+        'ALGORITHM': "MERGE (e:ALGORITHM {name: $name})",
+        'LOSS_FUNCTION': "MERGE (e:LOSS_FUNCTION {name: $name})",
+        'DATA_STRUCTURE': "MERGE (e:DATA_STRUCTURE {name: $name})",
+        'METRIC': "MERGE (e:METRIC {name: $name})",
+        'MECHANISM': "MERGE (e:MECHANISM {name: $name})",
+    }
+
+    merge_query = queries.get(entity.entity_type)
+    if not merge_query:
+        return
+
+    full_query = f"""
+        {merge_query}
+        SET e.confidence = CASE
+            WHEN e.confidence IS NULL OR $confidence > e.confidence
+            THEN $confidence ELSE e.confidence END,
+            e.last_seen = datetime()
+        WITH e
+        MATCH (p:Paper {{doc_id: $doc_id}})
+        MERGE (e)-[r:MENTIONED_IN]->(p)
+        SET r.passage_id = $passage_id,
+            r.source_text = $source_text,
+            r.char_start = $char_start,
+            r.char_end = $char_end
+    """
+
+    session.run(full_query, {
+        'name': entity.name,
+        'confidence': entity.confidence,
+        'doc_id': doc_id,
+        'passage_id': extraction.passage_id,
+        'source_text': entity.source_text,
+        'char_start': entity.char_start,
+        'char_end': entity.char_end
+    })
+
+
+def _store_relation_static(session, relation, extraction):
+    """Fallback for storing relations without APOC."""
+    queries = {
+        'APPLIES_TO': "MERGE (s)-[r:APPLIES_TO]->(t)",
+        'PREDICTS': "MERGE (s)-[r:PREDICTS]->(t)",
+        'OUTPERFORMS': "MERGE (s)-[r:OUTPERFORMS]->(t)",
+        'REQUIRES': "MERGE (s)-[r:REQUIRES]->(t)",
+        'TRAINED_ON': "MERGE (s)-[r:TRAINED_ON]->(t)",
+        'OPERATES_ON': "MERGE (s)-[r:OPERATES_ON]->(t)",
+        'EXPRESSES': "MERGE (s)-[r:EXPRESSES]->(t)",
+        'FOUND_IN': "MERGE (s)-[r:FOUND_IN]->(t)",
+        'USES_LOSS': "MERGE (s)-[r:USES_LOSS]->(t)",
+        'IMPLEMENTS': "MERGE (s)-[r:IMPLEMENTS]->(t)",
+    }
+
+    merge_query = queries.get(relation.relation_type)
+    if not merge_query:
+        return
+
+    full_query = f"""
+        MATCH (s {{name: $source_name}})
+        MATCH (t {{name: $target_name}})
+        {merge_query}
+        SET r.confidence = CASE
+            WHEN r.confidence IS NULL OR $confidence > r.confidence
+            THEN $confidence ELSE r.confidence END,
+            r.evidence = $evidence,
+            r.passage_id = $passage_id
+    """
+
+    session.run(full_query, {
+        'source_name': relation.source_entity,
+        'target_name': relation.target_entity,
+        'confidence': relation.confidence,
+        'evidence': relation.evidence_text,
+        'passage_id': extraction.passage_id
+    })
 
 
 # =============================================================================
