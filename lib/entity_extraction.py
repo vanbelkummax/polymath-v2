@@ -359,6 +359,198 @@ async def extract_entities_llm(
         )
 
 
+# =============================================================================
+# Batch API Functions (for hydrate_graph_batch.py)
+# =============================================================================
+
+def prepare_batch_request(text: str, passage_id: str) -> Dict[str, Any]:
+    """
+    Generate a single JSONL request object for the Gemini Batch API.
+
+    The Batch API expects JSONL files where each line is a request object.
+    This format matches the Gemini Batch API specification.
+
+    Args:
+        text: The passage text to extract entities from
+        passage_id: Unique identifier for the passage
+
+    Returns:
+        Dict matching Gemini Batch API input format
+    """
+    prompt = EXTRACTION_PROMPT.format(text=text[:8000])
+
+    return {
+        "custom_id": passage_id,
+        "request": {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.1
+            }
+        }
+    }
+
+
+def parse_batch_result(
+    batch_line: Dict[str, Any],
+    original_text: str
+) -> Optional[ExtractionResult]:
+    """
+    Parse a single line from the completed Batch output file.
+
+    Args:
+        batch_line: A single parsed JSON line from batch output
+        original_text: The original passage text (needed to recalculate char indices)
+
+    Returns:
+        ExtractionResult or None if parsing fails
+    """
+    try:
+        passage_id = batch_line.get('custom_id', '')
+
+        # Handle different response formats
+        response = batch_line.get('response', {})
+
+        # Check for error
+        if 'error' in response:
+            print(f"Batch error for {passage_id}: {response['error']}")
+            return None
+
+        # Extract the generated content
+        body = response.get('body', response)
+        candidates = body.get('candidates', [])
+
+        if not candidates:
+            print(f"No candidates in response for {passage_id}")
+            return None
+
+        # Get the JSON text from the response
+        content = candidates[0].get('content', {})
+        parts = content.get('parts', [])
+
+        if not parts:
+            print(f"No parts in response for {passage_id}")
+            return None
+
+        json_text = parts[0].get('text', '')
+
+        # Parse the JSON response
+        result = json.loads(json_text)
+
+        # Convert to Entity objects
+        entities = []
+        for e in result.get('entities', []):
+            confidence = float(e.get('confidence', 0))
+            if confidence < config.ENTITY_CONFIDENCE_THRESHOLD:
+                continue
+
+            source_span = e.get('source_span', e.get('name', ''))
+
+            # Find position in original text
+            char_start = original_text.find(source_span) if source_span else -1
+            char_end = char_start + len(source_span) if char_start >= 0 else -1
+
+            entities.append(Entity(
+                name=e['name'],
+                entity_type=e.get('type', 'UNKNOWN'),
+                confidence=confidence,
+                source_text=source_span,
+                char_start=char_start,
+                char_end=char_end
+            ))
+
+        # Convert to Relation objects
+        relations = []
+        for r in result.get('relations', []):
+            confidence = float(r.get('confidence', 0))
+            if confidence < config.RELATION_CONFIDENCE_THRESHOLD:
+                continue
+
+            relations.append(Relation(
+                source_entity=r.get('source', ''),
+                relation_type=r.get('relation', ''),
+                target_entity=r.get('target', ''),
+                confidence=confidence,
+                evidence_text=r.get('evidence', '')
+            ))
+
+        return ExtractionResult(
+            passage_id=passage_id,
+            entities=entities,
+            relations=relations,
+            extractor_version="v2.0-gemini-batch"
+        )
+
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error for {batch_line.get('custom_id', 'unknown')}: {e}")
+        return None
+    except Exception as e:
+        print(f"Error parsing batch result: {e}")
+        return None
+
+
+def prepare_batch_file(
+    passages: List[Dict[str, Any]],
+    output_path: Path
+) -> int:
+    """
+    Write a JSONL file of batch requests for multiple passages.
+
+    Args:
+        passages: List of dicts with 'passage_id' and 'passage_text' keys
+        output_path: Path to write the JSONL file
+
+    Returns:
+        Number of requests written
+    """
+    count = 0
+    with open(output_path, 'w') as f:
+        for passage in passages:
+            passage_id = str(passage.get('passage_id', ''))
+            text = passage.get('passage_text', '')
+
+            if not text or len(text) < 100:
+                continue
+
+            request = prepare_batch_request(text, passage_id)
+            f.write(json.dumps(request) + '\n')
+            count += 1
+
+    return count
+
+
+def parse_batch_file(
+    result_path: Path,
+    text_lookup: Dict[str, str]
+) -> List[ExtractionResult]:
+    """
+    Parse a completed batch result JSONL file.
+
+    Args:
+        result_path: Path to the batch output JSONL file
+        text_lookup: Dict mapping passage_id -> original passage text
+
+    Returns:
+        List of ExtractionResult objects
+    """
+    results = []
+
+    with open(result_path, 'r') as f:
+        for line in f:
+            if not line.strip():
+                continue
+
+            batch_line = json.loads(line)
+            passage_id = batch_line.get('custom_id', '')
+            original_text = text_lookup.get(passage_id, '')
+
+            result = parse_batch_result(batch_line, original_text)
+            if result:
+                results.append(result)
+
+    return results
+
+
 def extract_entities_sync(text: str, passage_id: str = "") -> ExtractionResult:
     """Synchronous wrapper for entity extraction."""
     import asyncio

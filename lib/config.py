@@ -43,6 +43,13 @@ class Config:
     # API Keys
     GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
 
+    # Batch Processing Config (Gemini Batch API)
+    GCS_BUCKET_NAME: str = os.getenv("GCS_BUCKET_NAME", "polymath-batch-staging")
+    GOOGLE_CLOUD_PROJECT: str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+    GOOGLE_CLOUD_LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+    BATCH_SIZE_LIMIT: int = 50000  # Max passages per batch job
+    BATCH_MODEL: str = "models/gemini-1.5-flash"  # Model for batch processing
+
     # Paths (override via environment for portability)
     PDF_ARCHIVE: Path = Path(os.getenv("PDF_ARCHIVE", "/scratch/polymath_archive/pdfs"))
     INGEST_STAGING: Path = Path(os.getenv("INGEST_STAGING", str(Path(__file__).parent.parent / "staging")))
