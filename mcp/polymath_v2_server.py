@@ -314,6 +314,211 @@ if USE_FASTMCP:
         return response
 
     @mcp.tool()
+    async def search_paper_code(
+        query: str,
+        paper_title: Optional[str] = None,
+        repo_name: Optional[str] = None,
+        limit: int = 10
+    ) -> str:
+        """
+        Search across both paper passages and linked code repositories.
+
+        Use this for:
+        - Finding implementation details for a method described in a paper
+        - Understanding how a paper's algorithm is actually coded
+        - Cross-referencing theoretical descriptions with code
+
+        Args:
+            query: Search query
+            paper_title: Optional paper title to focus search
+            repo_name: Optional repo name to focus search
+            limit: Maximum results per category
+
+        Returns:
+            Combined results from paper passages and code chunks
+        """
+        conn = get_pg_conn()
+        cur = conn.cursor()
+
+        response = f"## Search Results for: {query}\n\n"
+
+        # If paper_title provided, find the doc_id
+        doc_id = None
+        if paper_title:
+            cur.execute("""
+                SELECT doc_id, title FROM documents
+                WHERE title ILIKE %s
+                LIMIT 1
+            """, (f'%{paper_title}%',))
+            row = cur.fetchone()
+            if row:
+                doc_id = str(row[0])
+                response += f"**Paper**: {row[1]}\n\n"
+
+        # Search paper passages
+        response += "### Paper Passages\n\n"
+        if doc_id:
+            cur.execute("""
+                SELECT passage_text, section,
+                       ts_rank(to_tsvector('english', passage_text),
+                               plainto_tsquery('english', %s)) as score
+                FROM passages
+                WHERE doc_id = %s
+                  AND to_tsvector('english', passage_text) @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC
+                LIMIT %s
+            """, (query, doc_id, query, limit))
+        else:
+            cur.execute("""
+                SELECT p.passage_text, p.section, d.title,
+                       ts_rank(to_tsvector('english', p.passage_text),
+                               plainto_tsquery('english', %s)) as score
+                FROM passages p
+                JOIN documents d ON p.doc_id = d.doc_id
+                WHERE to_tsvector('english', p.passage_text) @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC
+                LIMIT %s
+            """, (query, query, limit))
+
+        passages = cur.fetchall()
+        if passages:
+            for i, row in enumerate(passages[:5], 1):
+                text = row[0][:300] if len(row[0]) > 300 else row[0]
+                section = row[1] or "Unknown"
+                if len(row) > 3:  # Has title
+                    response += f"**[{i}] {row[2][:50]}... ({section})**\n"
+                else:
+                    response += f"**[{i}] {section}**\n"
+                response += f"{text}...\n\n"
+        else:
+            response += "No matching passages found.\n\n"
+
+        # Get linked repos for the paper
+        response += "### Linked Repositories\n\n"
+        if doc_id:
+            cur.execute("""
+                SELECT repo_url, repo_owner, repo_name, confidence
+                FROM paper_repos
+                WHERE doc_id = %s
+                ORDER BY confidence DESC
+            """, (doc_id,))
+            repos = cur.fetchall()
+            if repos:
+                for r in repos:
+                    response += f"- [{r[1]}/{r[2]}]({r[0]}) (confidence: {r[3]:.2f})\n"
+            else:
+                response += "No linked repositories found.\n"
+        else:
+            response += "Provide paper_title to see linked repos.\n"
+
+        # Search code
+        response += "\n### Code Matches\n\n"
+        if repo_name:
+            cur.execute("""
+                SELECT cf.repo_name, cf.file_path, ch.name, ch.content,
+                       ts_rank(ch.search_vector, plainto_tsquery('english', %s)) as score
+                FROM code_chunks ch
+                JOIN code_files cf ON ch.file_id = cf.file_id
+                WHERE cf.repo_name = %s
+                  AND ch.search_vector @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC
+                LIMIT %s
+            """, (query, repo_name, query, limit))
+        elif doc_id:
+            # Search in repos linked to the paper
+            cur.execute("""
+                SELECT cf.repo_name, cf.file_path, ch.name, ch.content,
+                       ts_rank(ch.search_vector, plainto_tsquery('english', %s)) as score
+                FROM code_chunks ch
+                JOIN code_files cf ON ch.file_id = cf.file_id
+                JOIN paper_repos pr ON cf.repo_name = pr.repo_name
+                WHERE pr.doc_id = %s
+                  AND ch.search_vector @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC
+                LIMIT %s
+            """, (query, doc_id, query, limit))
+        else:
+            cur.execute("""
+                SELECT cf.repo_name, cf.file_path, ch.name, ch.content,
+                       ts_rank(ch.search_vector, plainto_tsquery('english', %s)) as score
+                FROM code_chunks ch
+                JOIN code_files cf ON ch.file_id = cf.file_id
+                WHERE ch.search_vector @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC
+                LIMIT %s
+            """, (query, query, limit))
+
+        code_results = cur.fetchall()
+        if code_results:
+            for row in code_results[:5]:
+                repo, filepath, name, content, score = row
+                response += f"**{repo}** - `{filepath}`\n"
+                if name:
+                    response += f"Function/Class: `{name}`\n"
+                code_preview = content[:200] if len(content) > 200 else content
+                response += f"```\n{code_preview}...\n```\n\n"
+        else:
+            response += "No matching code found.\n"
+
+        cur.close()
+        return response
+
+    @mcp.tool()
+    async def get_paper_repos(paper_title: str) -> str:
+        """
+        Get all GitHub repositories linked to a paper.
+
+        Use this for:
+        - Finding code implementations for a paper
+        - Checking if a paper has open source code
+        - Getting repo URLs for papers you're interested in
+
+        Args:
+            paper_title: Title or partial title of the paper
+
+        Returns:
+            List of linked repositories with metadata
+        """
+        conn = get_pg_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT d.title, d.year, d.doi, pr.repo_url, pr.repo_owner, pr.repo_name,
+                   pr.confidence, pr.context
+            FROM documents d
+            JOIN paper_repos pr ON d.doc_id = pr.doc_id
+            WHERE d.title ILIKE %s
+            ORDER BY pr.confidence DESC
+        """, (f'%{paper_title}%',))
+
+        results = cur.fetchall()
+        cur.close()
+
+        if not results:
+            return f"No papers found matching: {paper_title}"
+
+        response = f"## Repositories for papers matching: {paper_title}\n\n"
+
+        current_title = None
+        for row in results:
+            title, year, doi, url, owner, name, conf, context = row
+            if title != current_title:
+                current_title = title
+                response += f"### {title}"
+                if year:
+                    response += f" ({year})"
+                response += "\n"
+                if doi:
+                    response += f"DOI: {doi}\n"
+                response += "\n"
+
+            response += f"- **[{owner}/{name}]({url})** (confidence: {conf:.2f})\n"
+            if context:
+                response += f"  Context: _{context[:100]}..._\n"
+
+        return response
+
+    @mcp.tool()
     async def extract_entities_from_text(text: str) -> str:
         """
         Extract domain-specific entities from a piece of text.
