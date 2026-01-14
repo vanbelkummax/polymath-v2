@@ -63,12 +63,15 @@ from lib.entity_extraction import (
 from lib.hallucination_detector import HallucinationDetector, ValidationResult
 
 # Setup logging
+log_dir = Path(__file__).parent.parent / "logs"
+log_dir.mkdir(exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('/home/user/polymath-v2/logs/hydrate_graph.log')
+        logging.FileHandler(log_dir / 'hydrate_graph.log')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -126,7 +129,7 @@ class GraphHydrator:
 
         self.detector = HallucinationDetector()
         self.stats = HydrationStats(start_time=datetime.now())
-        self.checkpoint_file = Path('/home/user/polymath-v2/logs/hydrate_checkpoint.json')
+        self.checkpoint_file = Path(__file__).parent.parent / "logs" / "hydrate_checkpoint.json"
 
     def get_unprocessed_passages(
         self,
@@ -143,8 +146,8 @@ class GraphHydrator:
         # Base query: passages without entity extractions
         query = """
             SELECT p.passage_id, p.doc_id, p.passage_text, p.header, d.title
-            FROM passages_v2 p
-            JOIN documents_v2 d ON p.doc_id = d.doc_id
+            FROM passages p
+            JOIN documents d ON p.doc_id = d.doc_id
             LEFT JOIN passage_extractions pe ON p.passage_id = pe.passage_id
             WHERE pe.passage_id IS NULL
               AND LENGTH(p.passage_text) > 100
@@ -179,7 +182,7 @@ class GraphHydrator:
         # Get all passages with sufficient text
         query = """
             SELECT p.passage_id, p.doc_id, p.passage_text, p.header
-            FROM passages_v2 p
+            FROM passages p
             WHERE LENGTH(p.passage_text) > 100
             ORDER BY p.doc_id
         """
@@ -460,7 +463,7 @@ def ensure_schema(pg_conn):
     # Create tracking table if not exists
     cur.execute("""
         CREATE TABLE IF NOT EXISTS passage_extractions (
-            passage_id UUID PRIMARY KEY REFERENCES passages_v2(passage_id),
+            passage_id UUID PRIMARY KEY REFERENCES passages(passage_id),
             extracted_at TIMESTAMP DEFAULT NOW(),
             extractor_version TEXT,
             entity_count INTEGER,

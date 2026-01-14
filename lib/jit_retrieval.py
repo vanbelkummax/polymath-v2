@@ -175,21 +175,21 @@ async def retrieve_passages_deep(
     Optionally filters by doc_ids from concept index for focused search.
 
     Supports two modes:
-    1. passages_v2 with pgvector (full hybrid)
-    2. passages table with keyword search only (fallback)
+    1. passages with pgvector embedding column (full hybrid)
+    2. passages table with keyword search only (fallback if no embeddings)
     """
     cur = pg_conn.cursor()
 
-    # Check which table exists
+    # Check if passages table has embedding column (pgvector)
     cur.execute("""
         SELECT EXISTS (
-            SELECT FROM information_schema.tables
-            WHERE table_schema = 'public' AND table_name = 'passages_v2'
+            SELECT FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'passages' AND column_name = 'embedding'
         )
     """)
-    has_v2_table = cur.fetchone()[0]
+    has_embeddings = cur.fetchone()[0]
 
-    if has_v2_table:
+    if has_embeddings:
         # V2 mode: Full hybrid with pgvector
         query_embedding = embedder.encode([query])[0]
 
@@ -198,7 +198,7 @@ async def retrieve_passages_deep(
                 WITH vector_results AS (
                     SELECT passage_id, doc_id, passage_text, header,
                            1 - (embedding <=> %s::vector) AS vector_score
-                    FROM passages_v2
+                    FROM passages
                     WHERE doc_id = ANY(%s)
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
@@ -206,7 +206,7 @@ async def retrieve_passages_deep(
                 keyword_results AS (
                     SELECT passage_id, doc_id, passage_text, header,
                            ts_rank(search_vector, plainto_tsquery('english', %s)) AS keyword_score
-                    FROM passages_v2
+                    FROM passages
                     WHERE doc_id = ANY(%s)
                       AND search_vector @@ plainto_tsquery('english', %s)
                     ORDER BY keyword_score DESC
@@ -233,7 +233,7 @@ async def retrieve_passages_deep(
             cur.execute("""
                 SELECT passage_id, doc_id, passage_text, header,
                        1 - (embedding <=> %s::vector) AS score
-                FROM passages_v2
+                FROM passages
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
             """, (query_embedding.tolist(), query_embedding.tolist(), limit))

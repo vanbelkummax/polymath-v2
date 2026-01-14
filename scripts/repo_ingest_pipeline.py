@@ -364,8 +364,8 @@ def ingest_repo(clone_path: Path, repo_name: str, conn) -> Tuple[int, int]:
     Ingest a cloned repo into the database.
     Returns (file_count, chunk_count).
     """
-    # Import here to avoid circular dependency
-    sys.path.insert(0, str(Path("/home/user/polymath-repo")))
+    # Import from this repo's lib (not hardcoded path)
+    # TransactionalIngestor may be in polymath-repo if this is a fresh install
 
     try:
         from lib.unified_ingest import TransactionalIngestor

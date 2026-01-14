@@ -172,7 +172,7 @@ def store_to_postgres(
 
     Schema:
     - documents: Metadata (title, authors, DOI, etc.)
-    - passages_v2: Chunks with embeddings
+    - passages: Chunks with embeddings
     """
     from psycopg2.extras import execute_values
 
@@ -216,9 +216,12 @@ def store_to_postgres(
 
         if passage_data:
             execute_values(cur, """
-                INSERT INTO passages_v2
+                INSERT INTO passages
                     (passage_id, doc_id, passage_text, header, header_level, parent_header, char_start, char_end, embedding)
                 VALUES %s
+                ON CONFLICT (passage_id) DO UPDATE SET
+                    passage_text = EXCLUDED.passage_text,
+                    embedding = EXCLUDED.embedding
             """, passage_data, template="(%s, %s, %s, %s, %s, %s, %s, %s, %s::vector)")
 
         conn.commit()
@@ -333,7 +336,10 @@ def process_pdf(pdf_path: Path, embedder, pg_conn, neo4j_driver, dry_run: bool =
         return result
 
     # Step 5: Store to databases (using pooled connections)
-    doc_id = hashlib.sha256(pdf_path.name.encode()).hexdigest()[:16]
+    # Generate doc_id from file CONTENT (first 8KB) to avoid collision on common filenames
+    with open(pdf_path, 'rb') as f:
+        file_prefix = f.read(8192)
+    doc_id = hashlib.sha256(file_prefix).hexdigest()[:32]  # Use 32 chars for UUID compatibility
 
     try:
         store_to_postgres(pg_conn, doc_id, metadata, chunks, embeddings, pdf_path)

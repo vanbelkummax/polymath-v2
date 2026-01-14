@@ -34,7 +34,7 @@ class Config:
     NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", "polymathic2026")
 
     # ChromaDB (deprecated - migrating to pgvector)
-    CHROMADB_PATH: str = "/home/user/polymath-repo/chromadb"
+    CHROMADB_PATH: str = os.getenv("CHROMADB_PATH", str(Path(__file__).parent.parent / "chromadb"))
 
     # Zotero
     ZOTERO_API_KEY: Optional[str] = os.getenv("ZOTERO_API_KEY")
@@ -43,10 +43,10 @@ class Config:
     # API Keys
     GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
 
-    # Paths
-    PDF_ARCHIVE: Path = Path("/scratch/polymath_archive/pdfs")
-    INGEST_STAGING: Path = Path("/home/user/work/polymax/ingest_staging")
-    LOG_DIR: Path = Path("/home/user/work/polymax/logs")
+    # Paths (override via environment for portability)
+    PDF_ARCHIVE: Path = Path(os.getenv("PDF_ARCHIVE", "/scratch/polymath_archive/pdfs"))
+    INGEST_STAGING: Path = Path(os.getenv("INGEST_STAGING", str(Path(__file__).parent.parent / "staging")))
+    LOG_DIR: Path = Path(os.getenv("LOG_DIR", str(Path(__file__).parent.parent / "logs")))
 
     # Chunking Parameters (V2 - Structure-Aware)
     CHUNK_MAX_SIZE: int = 4000  # chars - only used as fallback for huge sections

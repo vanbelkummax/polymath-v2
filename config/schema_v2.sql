@@ -1,5 +1,8 @@
 -- Polymath V2 Schema - Postgres with pgvector
 --
+-- This schema is compatible with the existing production tables (documents, passages)
+-- but adds V2 enhancements: structure-aware passages, BGE-M3 embeddings, pgvector.
+--
 -- Key changes from V1:
 -- 1. Uses pgvector for embeddings (eliminates ChromaDB)
 -- 2. Structure-aware passages with header hierarchy
@@ -10,8 +13,12 @@
 -- Enable pgvector extension
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- Documents table (upgraded from V1)
-CREATE TABLE IF NOT EXISTS documents_v2 (
+-- ============================================================================
+-- CORE TABLES (V2 compatible with existing production data)
+-- ============================================================================
+
+-- Documents table (compatible with existing 'documents' table)
+CREATE TABLE IF NOT EXISTS documents (
     doc_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
     -- Core metadata
@@ -20,9 +27,9 @@ CREATE TABLE IF NOT EXISTS documents_v2 (
     year INTEGER,
 
     -- Identifiers (at least one should be populated)
-    doi TEXT UNIQUE,
-    arxiv_id TEXT UNIQUE,
-    pmid TEXT UNIQUE,
+    doi TEXT,
+    arxiv_id TEXT,
+    pmid TEXT,
     pmcid TEXT,
 
     -- Source tracking
@@ -39,79 +46,181 @@ CREATE TABLE IF NOT EXISTS documents_v2 (
     updated_at TIMESTAMP DEFAULT NOW(),
 
     -- Deduplication
-    title_hash TEXT GENERATED ALWAYS AS (encode(sha256(lower(title)::bytea), 'hex')) STORED
+    title_hash TEXT
 );
 
--- Passages table with embeddings (replaces ChromaDB)
-CREATE TABLE IF NOT EXISTS passages_v2 (
+-- Add unique constraints if they don't exist (idempotent)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'documents_doi_key') THEN
+        ALTER TABLE documents ADD CONSTRAINT documents_doi_key UNIQUE (doi);
+    END IF;
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+
+-- Passages table with embeddings (compatible with existing 'passages' table)
+CREATE TABLE IF NOT EXISTS passages (
     passage_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    doc_id UUID REFERENCES documents_v2(doc_id) ON DELETE CASCADE,
+    doc_id UUID REFERENCES documents(doc_id) ON DELETE CASCADE,
 
     -- Content
     passage_text TEXT NOT NULL,
 
-    -- Structure preservation (from markdown headers)
+    -- Structure preservation (from markdown headers) - V2 enhancement
     header TEXT,           -- Section header (e.g., "Methods", "Results")
     header_level INTEGER,  -- 1, 2, or 3
     parent_header TEXT,    -- Parent section for hierarchy
+    section TEXT,          -- Alias for header (backward compat)
 
     -- Position tracking
     char_start INTEGER,
     char_end INTEGER,
     page_num INTEGER,
 
-    -- BGE-M3 embedding (1024 dimensions)
+    -- BGE-M3 embedding (1024 dimensions) - V2 enhancement
     embedding vector(1024),
 
     -- Full-text search
-    search_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', passage_text)) STORED,
+    search_vector tsvector,
 
     -- Timestamps
     created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Code chunks table with embeddings
-CREATE TABLE IF NOT EXISTS code_chunks_v2 (
-    chunk_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+-- Add trigger for search_vector if not exists
+CREATE OR REPLACE FUNCTION passages_search_vector_trigger() RETURNS trigger AS $$
+BEGIN
+    NEW.search_vector := to_tsvector('english', COALESCE(NEW.passage_text, ''));
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
-    -- Repository info
+DROP TRIGGER IF EXISTS tsvector_update ON passages;
+CREATE TRIGGER tsvector_update BEFORE INSERT OR UPDATE ON passages
+    FOR EACH ROW EXECUTE FUNCTION passages_search_vector_trigger();
+
+-- ============================================================================
+-- CODE TABLES (compatible with existing code_files, code_chunks)
+-- ============================================================================
+
+-- Code files table
+CREATE TABLE IF NOT EXISTS code_files (
+    file_id SERIAL PRIMARY KEY,
     repo_name TEXT NOT NULL,
     file_path TEXT NOT NULL,
+    language TEXT,
+    file_hash TEXT,
+    loc INTEGER,
+    head_commit_sha TEXT DEFAULT 'HEAD',
+    created_at TIMESTAMP DEFAULT NOW(),
+
+    UNIQUE(repo_name, file_path, head_commit_sha)
+);
+
+-- Code chunks table
+CREATE TABLE IF NOT EXISTS code_chunks (
+    chunk_id SERIAL PRIMARY KEY,
+    file_id INTEGER REFERENCES code_files(file_id) ON DELETE CASCADE,
 
     -- Content
-    chunk_text TEXT NOT NULL,
+    content TEXT NOT NULL,
     chunk_type TEXT,  -- 'function', 'class', 'method', 'module'
-    language TEXT,
+    name TEXT,        -- function/class name
 
-    -- AST info (from tree-sitter)
-    function_name TEXT,
-    class_name TEXT,
+    -- Position
+    start_line INTEGER,
+    end_line INTEGER,
+
+    -- AST info
     docstring TEXT,
-
-    -- Summary for better semantic search
-    summary TEXT,  -- LLM-generated description
-
-    -- Embedding
-    embedding vector(1024),
+    chunk_hash TEXT,
 
     -- Full-text search
-    search_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', chunk_text)) STORED,
+    search_vector tsvector,
 
-    -- Timestamps
+    -- Embedding (optional, for semantic search)
+    embedding vector(1024),
+
     created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Concept extraction (V2 - with extractor tracking)
-CREATE TABLE IF NOT EXISTS passage_concepts_v2 (
+-- Add trigger for code chunks search_vector
+CREATE OR REPLACE FUNCTION code_chunks_search_vector_trigger() RETURNS trigger AS $$
+BEGIN
+    NEW.search_vector := to_tsvector('english', COALESCE(NEW.content, '') || ' ' || COALESCE(NEW.name, ''));
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS code_chunks_tsvector_update ON code_chunks;
+CREATE TRIGGER code_chunks_tsvector_update BEFORE INSERT OR UPDATE ON code_chunks
+    FOR EACH ROW EXECUTE FUNCTION code_chunks_search_vector_trigger();
+
+-- ============================================================================
+-- PAPER-REPO LINKING TABLES
+-- ============================================================================
+
+-- Paper-Repository linkage table
+CREATE TABLE IF NOT EXISTS paper_repos (
     id SERIAL PRIMARY KEY,
-    passage_id UUID REFERENCES passages_v2(passage_id) ON DELETE CASCADE,
+    doc_id UUID NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    repo_url TEXT NOT NULL,
+    repo_owner TEXT,
+    repo_name TEXT,
+    detection_method TEXT NOT NULL,  -- 'url_pattern', 'code_availability', 'auto_queue'
+    confidence FLOAT DEFAULT 1.0,
+    context TEXT,
+    verified BOOLEAN DEFAULT FALSE,
+    verified_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+
+    UNIQUE(doc_id, repo_url)
+);
+
+-- Queue for repos pending ingestion
+CREATE TABLE IF NOT EXISTS repo_ingest_queue (
+    id SERIAL PRIMARY KEY,
+    repo_url TEXT NOT NULL UNIQUE,
+    repo_owner TEXT NOT NULL,
+    repo_name TEXT NOT NULL,
+    source_doc_id UUID REFERENCES documents(doc_id) ON DELETE SET NULL,
+    status TEXT DEFAULT 'pending',  -- pending, cloning, ingesting, completed, failed, skipped
+    priority INT DEFAULT 0,
+    clone_path TEXT,
+    error_message TEXT,
+    file_count INT,
+    chunk_count INT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+);
+
+-- Track which papers triggered which repo ingestions
+CREATE TABLE IF NOT EXISTS paper_repo_triggers (
+    id SERIAL PRIMARY KEY,
+    doc_id UUID NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+    queue_id INT NOT NULL REFERENCES repo_ingest_queue(id) ON DELETE CASCADE,
+    context TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+
+    UNIQUE(doc_id, queue_id)
+);
+
+-- ============================================================================
+-- CONCEPT EXTRACTION TABLES
+-- ============================================================================
+
+-- Concept extraction for passages
+CREATE TABLE IF NOT EXISTS passage_concepts (
+    id SERIAL PRIMARY KEY,
+    passage_id UUID REFERENCES passages(passage_id) ON DELETE CASCADE,
 
     concept_name TEXT NOT NULL,
-    concept_type TEXT,  -- 'METHOD', 'PROBLEM', 'DOMAIN', 'MECHANISM'
+    concept_type TEXT,  -- 'METHOD', 'PROBLEM', 'DOMAIN', 'MECHANISM', 'GENE', 'CELL_TYPE'
     confidence REAL DEFAULT 1.0,
 
     -- Extraction tracking
-    extractor TEXT,  -- 'gemini', 'gpt4', 'regex'
+    extractor TEXT,           -- 'gemini', 'gpt4', 'regex', 'spacy'
     extractor_version TEXT,
 
     created_at TIMESTAMP DEFAULT NOW(),
@@ -119,32 +228,66 @@ CREATE TABLE IF NOT EXISTS passage_concepts_v2 (
     UNIQUE(passage_id, concept_name)
 );
 
--- Indexes for performance
+-- Concept extraction for code chunks
+CREATE TABLE IF NOT EXISTS chunk_concepts (
+    id SERIAL PRIMARY KEY,
+    chunk_id INTEGER REFERENCES code_chunks(chunk_id) ON DELETE CASCADE,
+
+    concept_name TEXT NOT NULL,
+    concept_type TEXT,
+    confidence REAL DEFAULT 1.0,
+
+    extractor TEXT,
+    extractor_version TEXT,
+
+    created_at TIMESTAMP DEFAULT NOW(),
+
+    UNIQUE(chunk_id, concept_name)
+);
+
+-- ============================================================================
+-- INDEXES
+-- ============================================================================
 
 -- Vector similarity search (HNSW for fast approximate search)
-CREATE INDEX IF NOT EXISTS idx_passages_v2_embedding
-    ON passages_v2 USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_passages_embedding
+    ON passages USING hnsw (embedding vector_cosine_ops);
 
-CREATE INDEX IF NOT EXISTS idx_code_chunks_v2_embedding
-    ON code_chunks_v2 USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_embedding
+    ON code_chunks USING hnsw (embedding vector_cosine_ops);
 
 -- Full-text search
-CREATE INDEX IF NOT EXISTS idx_passages_v2_search
-    ON passages_v2 USING gin (search_vector);
+CREATE INDEX IF NOT EXISTS idx_passages_search
+    ON passages USING gin (search_vector);
 
-CREATE INDEX IF NOT EXISTS idx_code_chunks_v2_search
-    ON code_chunks_v2 USING gin (search_vector);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_search
+    ON code_chunks USING gin (search_vector);
 
--- Lookups
-CREATE INDEX IF NOT EXISTS idx_documents_v2_doi ON documents_v2(doi);
-CREATE INDEX IF NOT EXISTS idx_documents_v2_year ON documents_v2(year);
-CREATE INDEX IF NOT EXISTS idx_documents_v2_title_hash ON documents_v2(title_hash);
-CREATE INDEX IF NOT EXISTS idx_passages_v2_doc ON passages_v2(doc_id);
-CREATE INDEX IF NOT EXISTS idx_passages_v2_header ON passages_v2(header);
-CREATE INDEX IF NOT EXISTS idx_code_chunks_v2_repo ON code_chunks_v2(repo_name);
+-- Document lookups
+CREATE INDEX IF NOT EXISTS idx_documents_doi ON documents(doi);
+CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year);
+CREATE INDEX IF NOT EXISTS idx_documents_title_hash ON documents(title_hash);
 
--- Hybrid search function (Vector + Keyword in one query)
-CREATE OR REPLACE FUNCTION hybrid_search_v2(
+-- Passage lookups
+CREATE INDEX IF NOT EXISTS idx_passages_doc ON passages(doc_id);
+CREATE INDEX IF NOT EXISTS idx_passages_header ON passages(header);
+
+-- Code lookups
+CREATE INDEX IF NOT EXISTS idx_code_files_repo ON code_files(repo_name);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_file ON code_chunks(file_id);
+
+-- Paper-repo lookups
+CREATE INDEX IF NOT EXISTS idx_paper_repos_doc ON paper_repos(doc_id);
+CREATE INDEX IF NOT EXISTS idx_paper_repos_repo ON paper_repos(repo_owner, repo_name);
+CREATE INDEX IF NOT EXISTS idx_repo_queue_status ON repo_ingest_queue(status);
+CREATE INDEX IF NOT EXISTS idx_repo_queue_priority ON repo_ingest_queue(priority DESC, created_at);
+
+-- ============================================================================
+-- HYBRID SEARCH FUNCTION
+-- ============================================================================
+
+-- Combined keyword + vector search in single query
+CREATE OR REPLACE FUNCTION hybrid_search(
     query_text TEXT,
     query_embedding vector(1024),
     keyword_weight REAL DEFAULT 0.3,
@@ -169,14 +312,15 @@ BEGIN
         SELECT
             p.passage_id,
             ts_rank(p.search_vector, plainto_tsquery('english', query_text)) as k_score
-        FROM passages_v2 p
+        FROM passages p
         WHERE p.search_vector @@ plainto_tsquery('english', query_text)
     ),
     vector_results AS (
         SELECT
             p.passage_id,
             1 - (p.embedding <=> query_embedding) as v_score
-        FROM passages_v2 p
+        FROM passages p
+        WHERE p.embedding IS NOT NULL
         ORDER BY p.embedding <=> query_embedding
         LIMIT result_limit * 2
     ),
@@ -202,24 +346,40 @@ BEGIN
         c.vector_score,
         c.combined_score
     FROM combined c
-    JOIN passages_v2 p ON c.passage_id = p.passage_id
-    JOIN documents_v2 d ON p.doc_id = d.doc_id
+    JOIN passages p ON c.passage_id = p.passage_id
+    JOIN documents d ON p.doc_id = d.doc_id
     ORDER BY c.combined_score DESC
     LIMIT result_limit;
 END;
 $$ LANGUAGE plpgsql;
 
--- Migration helper: Track what's been migrated
-CREATE TABLE IF NOT EXISTS v2_migrations (
-    migration_name TEXT PRIMARY KEY,
-    started_at TIMESTAMP DEFAULT NOW(),
-    completed_at TIMESTAMP,
+-- ============================================================================
+-- MIGRATION TRACKING
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS kb_migrations (
+    id SERIAL PRIMARY KEY,
+    job_name TEXT NOT NULL,
+    cursor_position TEXT,
+    status TEXT DEFAULT 'pending',  -- pending, running, completed, failed
     items_processed INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'running'
+    items_failed INTEGER DEFAULT 0,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+
+    UNIQUE(job_name)
 );
 
--- Comments
-COMMENT ON TABLE documents_v2 IS 'V2 documents with improved metadata tracking';
-COMMENT ON TABLE passages_v2 IS 'V2 passages with structure preservation and pgvector embeddings';
-COMMENT ON TABLE code_chunks_v2 IS 'V2 code chunks with AST info and summaries';
-COMMENT ON FUNCTION hybrid_search_v2 IS 'Combined keyword + vector search in single query';
+-- ============================================================================
+-- COMMENTS
+-- ============================================================================
+
+COMMENT ON TABLE documents IS 'Papers with metadata - compatible with V1, enhanced for V2';
+COMMENT ON TABLE passages IS 'Paper passages with structure preservation and BGE-M3 embeddings';
+COMMENT ON TABLE code_files IS 'Code repository files';
+COMMENT ON TABLE code_chunks IS 'Code chunks (functions, classes) with search vectors';
+COMMENT ON TABLE paper_repos IS 'Links between papers and their GitHub repositories';
+COMMENT ON TABLE repo_ingest_queue IS 'Queue for automatic repository ingestion';
+COMMENT ON FUNCTION hybrid_search IS 'Combined keyword + vector search in single query';
