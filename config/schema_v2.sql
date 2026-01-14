@@ -58,6 +58,24 @@ BEGIN
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 
+-- ============================================================================
+-- V1 → V2 MIGRATION: Add columns to existing tables
+-- These are safe to run multiple times (IF NOT EXISTS / exception handling)
+-- ============================================================================
+
+-- Add V2 columns to existing documents table
+DO $$
+BEGIN
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS arxiv_id TEXT;
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS pmcid TEXT;
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_method TEXT;
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS metadata_confidence REAL DEFAULT 0.0;
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS zotero_key TEXT;
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS zotero_synced_at TIMESTAMP;
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+
 -- Passages table with embeddings (compatible with existing 'passages' table)
 CREATE TABLE IF NOT EXISTS passages (
     passage_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -86,6 +104,17 @@ CREATE TABLE IF NOT EXISTS passages (
     -- Timestamps
     created_at TIMESTAMP DEFAULT NOW()
 );
+
+-- Add V2 columns to existing passages table (migration)
+DO $$
+BEGIN
+    ALTER TABLE passages ADD COLUMN IF NOT EXISTS header TEXT;
+    ALTER TABLE passages ADD COLUMN IF NOT EXISTS header_level INTEGER;
+    ALTER TABLE passages ADD COLUMN IF NOT EXISTS parent_header TEXT;
+    ALTER TABLE passages ADD COLUMN IF NOT EXISTS embedding vector(1024);
+    ALTER TABLE passages ADD COLUMN IF NOT EXISTS search_vector tsvector;
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
 
 -- Add trigger for search_vector if not exists
 CREATE OR REPLACE FUNCTION passages_search_vector_trigger() RETURNS trigger AS $$
