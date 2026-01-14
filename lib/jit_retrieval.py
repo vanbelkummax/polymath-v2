@@ -119,33 +119,36 @@ async def lookup_concept_index(
 
     with neo4j_driver.session() as session:
         if type_hints:
-            # Type-guided search
+            # Type-guided search - adapted for existing schema
+            # Schema: Passage -[MENTIONS]-> Concept (note: direction is Passage -> Concept)
             result = session.run("""
                 CALL db.index.fulltext.queryNodes('concept_name_fulltext', $query)
                 YIELD node, score
                 WHERE any(label IN labels(node) WHERE label IN $types)
                 WITH node, score
-                MATCH (node)-[r:MENTIONED_IN]->(p:Paper)
+                OPTIONAL MATCH (passage:Passage)-[:MENTIONS]->(node)
+                WITH node, score, collect(DISTINCT passage.passage_id)[0..50] AS passage_ids
                 RETURN node.name AS concept,
                        labels(node)[0] AS type,
                        score,
-                       collect(DISTINCT p.doc_id)[0..5] AS paper_ids,
-                       count(DISTINCT p) AS paper_count
+                       passage_ids,
+                       size(passage_ids) AS paper_count
                 ORDER BY score DESC
                 LIMIT $limit
             """, {'query': query, 'types': type_hints, 'limit': limit})
         else:
-            # General search
+            # General search - adapted for existing schema
             result = session.run("""
                 CALL db.index.fulltext.queryNodes('concept_name_fulltext', $query)
                 YIELD node, score
                 WITH node, score
-                MATCH (node)-[r:MENTIONED_IN]->(p:Paper)
+                OPTIONAL MATCH (passage:Passage)-[:MENTIONS]->(node)
+                WITH node, score, collect(DISTINCT passage.passage_id)[0..50] AS passage_ids
                 RETURN node.name AS concept,
                        labels(node)[0] AS type,
                        score,
-                       collect(DISTINCT p.doc_id)[0..5] AS paper_ids,
-                       count(DISTINCT p) AS paper_count
+                       passage_ids,
+                       size(passage_ids) AS paper_count
                 ORDER BY score DESC
                 LIMIT $limit
             """, {'query': query, 'limit': limit})
@@ -170,57 +173,94 @@ async def retrieve_passages_deep(
 
     This is query-time retrieval - no pre-summarization.
     Optionally filters by doc_ids from concept index for focused search.
-    """
-    query_embedding = embedder.encode([query])[0]
 
+    Supports two modes:
+    1. passages_v2 with pgvector (full hybrid)
+    2. passages table with keyword search only (fallback)
+    """
     cur = pg_conn.cursor()
 
-    if use_hybrid and concept_doc_ids:
-        # Hybrid: Vector + keyword + concept-guided filtering
-        cur.execute("""
-            WITH vector_results AS (
+    # Check which table exists
+    cur.execute("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = 'passages_v2'
+        )
+    """)
+    has_v2_table = cur.fetchone()[0]
+
+    if has_v2_table:
+        # V2 mode: Full hybrid with pgvector
+        query_embedding = embedder.encode([query])[0]
+
+        if use_hybrid and concept_doc_ids:
+            cur.execute("""
+                WITH vector_results AS (
+                    SELECT passage_id, doc_id, passage_text, header,
+                           1 - (embedding <=> %s::vector) AS vector_score
+                    FROM passages_v2
+                    WHERE doc_id = ANY(%s)
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                ),
+                keyword_results AS (
+                    SELECT passage_id, doc_id, passage_text, header,
+                           ts_rank(search_vector, plainto_tsquery('english', %s)) AS keyword_score
+                    FROM passages_v2
+                    WHERE doc_id = ANY(%s)
+                      AND search_vector @@ plainto_tsquery('english', %s)
+                    ORDER BY keyword_score DESC
+                    LIMIT %s
+                )
+                SELECT COALESCE(v.passage_id, k.passage_id) AS passage_id,
+                       COALESCE(v.doc_id, k.doc_id) AS doc_id,
+                       COALESCE(v.passage_text, k.passage_text) AS passage_text,
+                       COALESCE(v.header, k.header) AS header,
+                       COALESCE(v.vector_score, 0) AS vector_score,
+                       COALESCE(k.keyword_score, 0) AS keyword_score,
+                       (0.7 * COALESCE(v.vector_score, 0) + 0.3 * COALESCE(k.keyword_score, 0)) AS combined_score
+                FROM vector_results v
+                FULL OUTER JOIN keyword_results k ON v.passage_id = k.passage_id
+                ORDER BY combined_score DESC
+                LIMIT %s
+            """, (
+                query_embedding.tolist(), concept_doc_ids,
+                query_embedding.tolist(), limit,
+                query, concept_doc_ids, query, limit,
+                limit
+            ))
+        else:
+            cur.execute("""
                 SELECT passage_id, doc_id, passage_text, header,
-                       1 - (embedding <=> %s::vector) AS vector_score
+                       1 - (embedding <=> %s::vector) AS score
                 FROM passages_v2
-                WHERE doc_id = ANY(%s)
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
-            ),
-            keyword_results AS (
-                SELECT passage_id, doc_id, passage_text, header,
-                       ts_rank(search_vector, plainto_tsquery('english', %s)) AS keyword_score
-                FROM passages_v2
-                WHERE doc_id = ANY(%s)
-                  AND search_vector @@ plainto_tsquery('english', %s)
-                ORDER BY keyword_score DESC
-                LIMIT %s
-            )
-            SELECT COALESCE(v.passage_id, k.passage_id) AS passage_id,
-                   COALESCE(v.doc_id, k.doc_id) AS doc_id,
-                   COALESCE(v.passage_text, k.passage_text) AS passage_text,
-                   COALESCE(v.header, k.header) AS header,
-                   COALESCE(v.vector_score, 0) AS vector_score,
-                   COALESCE(k.keyword_score, 0) AS keyword_score,
-                   (0.7 * COALESCE(v.vector_score, 0) + 0.3 * COALESCE(k.keyword_score, 0)) AS combined_score
-            FROM vector_results v
-            FULL OUTER JOIN keyword_results k ON v.passage_id = k.passage_id
-            ORDER BY combined_score DESC
-            LIMIT %s
-        """, (
-            query_embedding.tolist(), concept_doc_ids,
-            query_embedding.tolist(), limit,
-            query, concept_doc_ids, query, limit,
-            limit
-        ))
+            """, (query_embedding.tolist(), query_embedding.tolist(), limit))
     else:
-        # Vector-only search across all documents
-        cur.execute("""
-            SELECT passage_id, doc_id, passage_text, header,
-                   1 - (embedding <=> %s::vector) AS score
-            FROM passages_v2
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s
-        """, (query_embedding.tolist(), query_embedding.tolist(), limit))
+        # Fallback mode: Use existing passages table with keyword search
+        # This works with the main polymath system's schema
+        if concept_doc_ids:
+            cur.execute("""
+                SELECT passage_id, doc_id, passage_text, section AS header,
+                       ts_rank(to_tsvector('english', passage_text),
+                               plainto_tsquery('english', %s)) AS score
+                FROM passages
+                WHERE doc_id = ANY(%s::uuid[])
+                  AND to_tsvector('english', passage_text) @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC
+                LIMIT %s
+            """, (query, concept_doc_ids, query, limit))
+        else:
+            cur.execute("""
+                SELECT passage_id, doc_id, passage_text, section AS header,
+                       ts_rank(to_tsvector('english', passage_text),
+                               plainto_tsquery('english', %s)) AS score
+                FROM passages
+                WHERE to_tsvector('english', passage_text) @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC
+                LIMIT %s
+            """, (query, query, limit))
 
     columns = [desc[0] for desc in cur.description]
     results = [dict(zip(columns, row)) for row in cur.fetchall()]
@@ -237,7 +277,7 @@ async def synthesize_at_runtime(
     query: str,
     passages: List[Dict],
     concepts: List[Dict],
-    model: str = "gemini-1.5-flash"
+    model: str = "gemini-2.0-flash"
 ) -> Tuple[str, float]:
     """
     Synthesize answer at query time from raw passages.
@@ -245,8 +285,6 @@ async def synthesize_at_runtime(
     This is the key GAM insight: synthesis happens at retrieval time,
     not at ingestion time. The query context guides what to emphasize.
     """
-    import google.generativeai as genai
-
     if not config.GEMINI_API_KEY:
         # Fallback: simple concatenation
         synthesis = "Retrieved passages:\n\n"
@@ -254,8 +292,15 @@ async def synthesize_at_runtime(
             synthesis += f"[{i}] {p.get('header', 'Unknown')}: {p.get('passage_text', '')[:500]}...\n\n"
         return synthesis, 0.5
 
-    genai.configure(api_key=config.GEMINI_API_KEY)
-    model_instance = genai.GenerativeModel(model)
+    # Use the new google.genai SDK
+    try:
+        from google import genai
+        client = genai.Client(api_key=config.GEMINI_API_KEY)
+    except ImportError:
+        # Fall back to deprecated SDK
+        import google.generativeai as genai
+        genai.configure(api_key=config.GEMINI_API_KEY)
+        client = None
 
     # Build context from passages
     passage_context = "\n\n".join([
@@ -288,15 +333,29 @@ Instructions:
 SYNTHESIS:"""
 
     try:
-        response = await model_instance.generate_content_async(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                temperature=0.2,  # Low temperature for factual synthesis
-                max_output_tokens=1000
+        if client:
+            # New google.genai SDK
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config={
+                    "temperature": 0.2,
+                    "max_output_tokens": 1000
+                }
             )
-        )
-
-        return response.text, 0.9
+            return response.text, 0.9
+        else:
+            # Deprecated SDK fallback
+            import google.generativeai as genai
+            model_instance = genai.GenerativeModel(model)
+            response = await model_instance.generate_content_async(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    temperature=0.2,
+                    max_output_tokens=1000
+                )
+            )
+            return response.text, 0.9
 
     except Exception as e:
         print(f"Synthesis failed: {e}")
@@ -333,6 +392,22 @@ class JITRetriever:
         self.neo4j_driver = neo4j_driver
         self.embedder = embedder or get_embedder()
 
+    async def _get_doc_ids_for_passages(self, passage_ids: List[str]) -> List[str]:
+        """Get doc_ids for a list of passage_ids from Postgres."""
+        if not passage_ids:
+            return []
+
+        cur = self.pg_conn.cursor()
+        try:
+            cur.execute("""
+                SELECT DISTINCT doc_id::text
+                FROM passages
+                WHERE passage_id = ANY(%s::uuid[])
+            """, (passage_ids,))
+            return [row[0] for row in cur.fetchall()]
+        finally:
+            cur.close()
+
     async def retrieve(
         self,
         query: str,
@@ -364,13 +439,19 @@ class JITRetriever:
         )
         retrieval_path.append(f"Found {len(concepts)} concepts in index")
 
-        # Extract doc_ids from concepts for focused retrieval
-        concept_doc_ids = list(set(
-            doc_id
+        # Extract passage_ids from concepts for focused retrieval
+        concept_passage_ids = list(set(
+            str(pid)  # Ensure string format
             for c in concepts
-            for doc_id in c.get('paper_ids', [])
+            for pid in c.get('passage_ids', [])
+            if pid
         ))
-        retrieval_path.append(f"Concept-linked docs: {len(concept_doc_ids)}")
+        retrieval_path.append(f"Concept-linked passages: {len(concept_passage_ids)}")
+
+        # Also get doc_ids from these passages for broader search
+        concept_doc_ids = None
+        if concept_passage_ids:
+            concept_doc_ids = await self._get_doc_ids_for_passages(concept_passage_ids[:100])
 
         # Step 3: Deep passage retrieval
         if query_type == 'factual':
