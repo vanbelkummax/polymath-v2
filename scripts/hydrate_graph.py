@@ -476,7 +476,14 @@ def ensure_schema(pg_conn):
 
 
 def ensure_neo4j_indexes(driver):
-    """Create Neo4j indexes for efficient queries."""
+    """
+    Create Neo4j constraints and indexes for efficient queries.
+
+    Uses UNIQUE CONSTRAINTS instead of plain indexes:
+    - Constraints prevent duplicate nodes (critical for MERGE correctness)
+    - Constraints automatically create backing indexes
+    - Faster lookups than plain indexes
+    """
     with driver.session() as session:
         # Fulltext index for concept search
         try:
@@ -488,14 +495,44 @@ def ensure_neo4j_indexes(driver):
         except Exception as e:
             logger.warning(f"Could not create fulltext index: {e}")
 
-        # Regular indexes for common lookups
+        # UNIQUE CONSTRAINTS for entity types (prevent duplicates, faster MERGE)
         for label in config.SPATIAL_TX_ENTITY_TYPES:
             try:
-                session.run(f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.name)")
-            except Exception:
-                pass
+                # Neo4j 4.x+ syntax for unique constraints
+                session.run(f"""
+                    CREATE CONSTRAINT {label.lower()}_name_unique IF NOT EXISTS
+                    FOR (n:{label})
+                    REQUIRE n.name IS UNIQUE
+                """)
+                logger.debug(f"Created unique constraint for {label}")
+            except Exception as e:
+                # Fallback to index if constraint creation fails
+                try:
+                    session.run(f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.name)")
+                except Exception:
+                    pass
 
-        logger.info("Neo4j indexes verified")
+        # Paper node constraint
+        try:
+            session.run("""
+                CREATE CONSTRAINT paper_doc_id_unique IF NOT EXISTS
+                FOR (p:Paper)
+                REQUIRE p.doc_id IS UNIQUE
+            """)
+        except Exception as e:
+            logger.warning(f"Could not create Paper constraint: {e}")
+
+        # Passage node constraint
+        try:
+            session.run("""
+                CREATE CONSTRAINT passage_id_unique IF NOT EXISTS
+                FOR (p:Passage)
+                REQUIRE p.passage_id IS UNIQUE
+            """)
+        except Exception as e:
+            logger.warning(f"Could not create Passage constraint: {e}")
+
+        logger.info("Neo4j constraints and indexes verified")
 
 
 def main():

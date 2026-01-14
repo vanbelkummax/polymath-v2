@@ -257,25 +257,39 @@ def get_batch_job_status(job_id: str) -> Dict:
     }
 
 
-def wait_for_batch_job(job_id: str, poll_interval: int = 60, max_wait: int = 86400) -> Dict:
+def wait_for_batch_job(
+    job_id: str,
+    initial_interval: int = 30,
+    max_interval: int = 300,
+    max_wait: int = 86400
+) -> Dict:
     """
-    Poll until batch job completes.
+    Poll until batch job completes using exponential backoff.
+
+    Reduces API chatter by starting with shorter intervals and
+    increasing them over time (batch jobs typically take 10+ minutes).
 
     Args:
         job_id: The job name/ID
-        poll_interval: Seconds between status checks
-        max_wait: Maximum seconds to wait
+        initial_interval: Starting seconds between checks (default: 30s)
+        max_interval: Maximum seconds between checks (default: 5min)
+        max_wait: Maximum seconds to wait total (default: 24h)
 
     Returns:
         Final job status
     """
     start_time = time.time()
+    current_interval = initial_interval
+    poll_count = 0
 
     while time.time() - start_time < max_wait:
+        poll_count += 1
+        elapsed = time.time() - start_time
+
         status = get_batch_job_status(job_id)
         state = status.get('state', '')
 
-        logger.info(f"Job {job_id}: {state}")
+        logger.info(f"[Poll #{poll_count}, {elapsed/60:.1f}m elapsed] Job {job_id}: {state}")
 
         if state in ['JOB_STATE_SUCCEEDED', 'SUCCEEDED', 'STATE_SUCCEEDED']:
             logger.info("Batch job completed successfully!")
@@ -287,9 +301,14 @@ def wait_for_batch_job(job_id: str, poll_interval: int = 60, max_wait: int = 864
             logger.warning("Batch job was cancelled")
             return status
 
-        time.sleep(poll_interval)
+        # Exponential backoff with jitter
+        logger.debug(f"Sleeping for {current_interval}s before next poll")
+        time.sleep(current_interval)
 
-    logger.warning(f"Timed out waiting for job after {max_wait}s")
+        # Increase interval with exponential backoff (1.5x each time, capped)
+        current_interval = min(int(current_interval * 1.5), max_interval)
+
+    logger.warning(f"Timed out waiting for job after {max_wait}s ({poll_count} polls)")
     return get_batch_job_status(job_id)
 
 
@@ -616,8 +635,8 @@ Examples:
     run_parser = subparsers.add_parser('run', help='Run full pipeline')
     run_parser.add_argument('--limit', type=int, default=50000,
                            help='Maximum passages to process')
-    run_parser.add_argument('--poll-interval', type=int, default=60,
-                           help='Seconds between status checks (default: 60)')
+    run_parser.add_argument('--poll-interval', type=int, default=30,
+                           help='Initial seconds between status checks, increases with backoff (default: 30)')
 
     args = parser.parse_args()
 
@@ -679,9 +698,9 @@ Examples:
             job_id = phase_submit(gcs_uri, state)
             state.save(state_file)
 
-            # Wait for completion
-            logger.info(f"\nWaiting for job to complete (polling every {args.poll_interval}s)...")
-            final_status = wait_for_batch_job(job_id, poll_interval=args.poll_interval)
+            # Wait for completion (exponential backoff reduces API chatter)
+            logger.info(f"\nWaiting for job to complete (starting interval: {args.poll_interval}s, with backoff)...")
+            final_status = wait_for_batch_job(job_id, initial_interval=args.poll_interval)
 
             if final_status.get('state') not in ['JOB_STATE_SUCCEEDED', 'SUCCEEDED', 'STATE_SUCCEEDED']:
                 logger.error("Job did not complete successfully")

@@ -30,7 +30,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from lib.config import config
-from lib.chunking import chunk_markdown_by_headers, Chunk, get_chunk_with_context
+from lib.chunking import chunk_markdown_by_headers, chunk_plain_text, Chunk, get_chunk_with_context
 from lib.embeddings import get_embedder
 from lib.metadata import get_paper_metadata, PaperMetadata
 
@@ -312,9 +312,17 @@ def process_pdf(pdf_path: Path, embedder, pg_conn, neo4j_driver, dry_run: bool =
 
     print(f"[{method}] {len(text):,} chars")
 
-    # Step 3: Chunk by markdown headers (NOT sliding window!)
-    print(f"  [3/4] Chunking by headers...", end=" ", flush=True)
-    chunks = chunk_markdown_by_headers(text)
+    # Step 3: Chunk appropriately based on extraction method
+    # MinerU outputs markdown → use markdown chunker
+    # fitz outputs plain text → use plain text chunker with heuristic header detection
+    print(f"  [3/4] Chunking ({method})...", end=" ", flush=True)
+
+    if method == "mineru":
+        chunks = chunk_markdown_by_headers(text)
+    else:
+        # fitz or other plain-text extractors
+        chunks = chunk_plain_text(text)
+
     result['chunks'] = len(chunks)
 
     if not chunks:

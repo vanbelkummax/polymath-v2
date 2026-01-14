@@ -312,10 +312,14 @@ CREATE INDEX IF NOT EXISTS idx_repo_queue_status ON repo_ingest_queue(status);
 CREATE INDEX IF NOT EXISTS idx_repo_queue_priority ON repo_ingest_queue(priority DESC, created_at);
 
 -- ============================================================================
--- HYBRID SEARCH FUNCTION
+-- HYBRID SEARCH FUNCTION (Optimized)
 -- ============================================================================
 
--- Combined keyword + vector search in single query
+-- Combined keyword + vector search using "retrieve then rerank" pattern
+-- Avoids expensive FULL OUTER JOIN by:
+-- 1. Getting top candidates from vector search (fast HNSW index)
+-- 2. Scoring those candidates with keyword search
+-- 3. Combining scores for final ranking
 CREATE OR REPLACE FUNCTION hybrid_search(
     query_text TEXT,
     query_embedding vector(1024),
@@ -337,31 +341,91 @@ RETURNS TABLE (
 ) AS $$
 BEGIN
     RETURN QUERY
-    WITH keyword_results AS (
-        SELECT
-            p.passage_id,
-            ts_rank(p.search_vector, plainto_tsquery('english', query_text)) as k_score
-        FROM passages p
-        WHERE p.search_vector @@ plainto_tsquery('english', query_text)
-    ),
-    vector_results AS (
+    WITH
+    -- Step 1: Get vector candidates (limited, uses HNSW index)
+    vector_candidates AS (
         SELECT
             p.passage_id,
             1 - (p.embedding <=> query_embedding) as v_score
         FROM passages p
         WHERE p.embedding IS NOT NULL
         ORDER BY p.embedding <=> query_embedding
-        LIMIT result_limit * 2
+        LIMIT result_limit * 3  -- Over-fetch to allow for keyword boost
     ),
+    -- Step 2: Score candidates with keyword search
+    scored AS (
+        SELECT
+            vc.passage_id,
+            COALESCE(ts_rank(p.search_vector, plainto_tsquery('english', query_text)), 0) as k_score,
+            vc.v_score,
+            (COALESCE(ts_rank(p.search_vector, plainto_tsquery('english', query_text)), 0) * keyword_weight +
+             vc.v_score * vector_weight) as combined_score
+        FROM vector_candidates vc
+        JOIN passages p ON vc.passage_id = p.passage_id
+    )
+    -- Step 3: Return results with metadata
+    SELECT
+        s.passage_id,
+        p.doc_id,
+        p.passage_text,
+        p.header,
+        d.title,
+        d.year,
+        d.doi,
+        s.k_score as keyword_score,
+        s.v_score as vector_score,
+        s.combined_score
+    FROM scored s
+    JOIN passages p ON s.passage_id = p.passage_id
+    JOIN documents d ON p.doc_id = d.doc_id
+    ORDER BY s.combined_score DESC
+    LIMIT result_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Strict mode: requires matches in BOTH vector and keyword search
+CREATE OR REPLACE FUNCTION hybrid_search_strict(
+    query_text TEXT,
+    query_embedding vector(1024),
+    keyword_weight REAL DEFAULT 0.3,
+    vector_weight REAL DEFAULT 0.7,
+    result_limit INTEGER DEFAULT 20
+)
+RETURNS TABLE (
+    passage_id UUID,
+    doc_id UUID,
+    passage_text TEXT,
+    header TEXT,
+    title TEXT,
+    year INTEGER,
+    doi TEXT,
+    keyword_score REAL,
+    vector_score REAL,
+    combined_score REAL
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH
+    -- Get keyword matches
+    keyword_matches AS (
+        SELECT
+            p.passage_id,
+            ts_rank(p.search_vector, plainto_tsquery('english', query_text)) as k_score
+        FROM passages p
+        WHERE p.search_vector @@ plainto_tsquery('english', query_text)
+          AND p.embedding IS NOT NULL
+        LIMIT result_limit * 5
+    ),
+    -- Score with vectors (INNER JOIN ensures both match)
     combined AS (
         SELECT
-            COALESCE(k.passage_id, v.passage_id) as passage_id,
-            COALESCE(k.k_score, 0) as keyword_score,
-            COALESCE(v.v_score, 0) as vector_score,
-            (COALESCE(k.k_score, 0) * keyword_weight +
-             COALESCE(v.v_score, 0) * vector_weight) as combined_score
-        FROM keyword_results k
-        FULL OUTER JOIN vector_results v ON k.passage_id = v.passage_id
+            km.passage_id,
+            km.k_score,
+            1 - (p.embedding <=> query_embedding) as v_score,
+            (km.k_score * keyword_weight +
+             (1 - (p.embedding <=> query_embedding)) * vector_weight) as combined_score
+        FROM keyword_matches km
+        JOIN passages p ON km.passage_id = p.passage_id
     )
     SELECT
         c.passage_id,
@@ -371,8 +435,8 @@ BEGIN
         d.title,
         d.year,
         d.doi,
-        c.keyword_score,
-        c.vector_score,
+        c.k_score as keyword_score,
+        c.v_score as vector_score,
         c.combined_score
     FROM combined c
     JOIN passages p ON c.passage_id = p.passage_id

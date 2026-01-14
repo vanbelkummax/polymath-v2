@@ -173,6 +173,134 @@ def _split_large_section(
     return chunks
 
 
+def chunk_plain_text(text: str, max_size: int = 4000, min_size: int = 50) -> List[Chunk]:
+    """
+    Chunk plain text (e.g., from fitz/PyMuPDF extraction) using heuristics.
+
+    Since fitz doesn't produce markdown headers, we use:
+    1. Paragraph splitting (double newlines)
+    2. ALL-CAPS line detection as pseudo-headers
+    3. Line starting with common section names (Abstract, Methods, Results, etc.)
+
+    This is a fallback for when MinerU fails - structure preservation is best-effort.
+
+    Args:
+        text: Plain text from fitz extraction
+        max_size: Maximum chars per chunk
+        min_size: Minimum chars to keep a chunk
+
+    Returns:
+        List of Chunk objects
+    """
+    chunks = []
+
+    # Common section header patterns (case-insensitive)
+    section_patterns = [
+        r'^(ABSTRACT|INTRODUCTION|BACKGROUND|METHODS|MATERIALS\s+AND\s+METHODS|'
+        r'RESULTS|DISCUSSION|CONCLUSION|CONCLUSIONS|REFERENCES|ACKNOWLEDGMENTS|'
+        r'SUPPLEMENTARY|APPENDIX|FUNDING|AUTHOR\s+CONTRIBUTIONS|DATA\s+AVAILABILITY)'
+        r'[\s:]*$'
+    ]
+
+    # Split into lines and detect pseudo-headers
+    lines = text.split('\n')
+    sections = []
+    current_section = {'header': 'Document', 'lines': [], 'start': 0}
+    char_pos = 0
+
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+
+        # Check if this line looks like a section header
+        is_header = False
+        header_text = None
+
+        # Pattern 1: ALL CAPS line (likely header)
+        if (line_stripped.isupper() and
+            len(line_stripped) > 3 and
+            len(line_stripped) < 80 and
+            not line_stripped.startswith('(')):
+            is_header = True
+            header_text = line_stripped.title()  # Convert to title case
+
+        # Pattern 2: Common section names (case-insensitive)
+        for pattern in section_patterns:
+            if re.match(pattern, line_stripped, re.IGNORECASE):
+                is_header = True
+                header_text = line_stripped.title()
+                break
+
+        # Pattern 3: Line followed by underline (rare but some formats)
+        if i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if next_line and all(c in '=-' for c in next_line) and len(next_line) > 3:
+                is_header = True
+                header_text = line_stripped
+
+        if is_header and header_text:
+            # Save current section if it has content
+            if current_section['lines']:
+                content = '\n'.join(current_section['lines']).strip()
+                if len(content) >= min_size:
+                    sections.append({
+                        'header': current_section['header'],
+                        'content': content,
+                        'start': current_section['start'],
+                        'end': char_pos
+                    })
+            # Start new section
+            current_section = {
+                'header': header_text,
+                'lines': [],
+                'start': char_pos
+            }
+        else:
+            current_section['lines'].append(line)
+
+        char_pos += len(line) + 1  # +1 for newline
+
+    # Don't forget the last section
+    if current_section['lines']:
+        content = '\n'.join(current_section['lines']).strip()
+        if len(content) >= min_size:
+            sections.append({
+                'header': current_section['header'],
+                'content': content,
+                'start': current_section['start'],
+                'end': char_pos
+            })
+
+    # If no sections were detected, treat the whole text as one chunk
+    if not sections:
+        content = text.strip()
+        if len(content) >= min_size:
+            sections = [{'header': 'Document', 'content': content, 'start': 0, 'end': len(text)}]
+
+    # Convert sections to Chunk objects, splitting large sections
+    for section in sections:
+        content = section['content']
+        header = section['header']
+
+        if len(content) > max_size:
+            # Split large sections by paragraph
+            sub_chunks = _split_large_section(
+                content, header, level=1, parent=None,
+                max_size=max_size, base_offset=section['start']
+            )
+            chunks.extend(sub_chunks)
+        else:
+            chunks.append(Chunk(
+                header=header,
+                content=content,
+                level=1,
+                parent_header=None,
+                char_start=section['start'],
+                char_end=section['end']
+            ))
+
+    return chunks
+
+
 def chunk_text_sliding_window(text: str, size: int = 1500, overlap: int = 200) -> List[str]:
     """
     DEPRECATED: Old-style sliding window chunking.
@@ -182,7 +310,7 @@ def chunk_text_sliding_window(text: str, size: int = 1500, overlap: int = 200) -
     """
     import warnings
     warnings.warn(
-        "chunk_text_sliding_window is deprecated. Use chunk_markdown_by_headers instead.",
+        "chunk_text_sliding_window is deprecated. Use chunk_markdown_by_headers or chunk_plain_text instead.",
         DeprecationWarning
     )
 

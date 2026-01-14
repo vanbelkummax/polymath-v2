@@ -23,6 +23,21 @@ from difflib import SequenceMatcher
 from lib.config import config
 
 
+def _normalize_whitespace(text: str) -> str:
+    """
+    Normalize whitespace for comparison.
+
+    PDF extraction often produces:
+    - "EGFR\nexpression" instead of "EGFR expression"
+    - Multiple spaces between words
+    - Tabs and other whitespace characters
+
+    This normalizes all of those to single spaces.
+    """
+    # Replace all whitespace (newlines, tabs, multiple spaces) with single space
+    return ' '.join(text.split())
+
+
 @dataclass
 class ValidationResult:
     """Result of hallucination validation."""
@@ -65,38 +80,42 @@ def validate_extraction(
     issues = []
     suggestions = []
 
-    # Check 1: Source span exists in text
-    if source_span not in source_text:
+    # Normalize whitespace for comparison (handles PDF extraction artifacts)
+    normalized_text = _normalize_whitespace(source_text)
+    normalized_span = _normalize_whitespace(source_span)
+
+    # Check 1: Source span exists in text (normalized)
+    if normalized_span not in normalized_text:
         # Try fuzzy matching
         best_match = None
         best_ratio = 0
 
-        # Sliding window search
-        words = source_text.split()
-        span_words = len(source_span.split())
+        # Sliding window search on normalized text
+        words = normalized_text.split()
+        span_words = len(normalized_span.split())
 
         for i in range(len(words) - span_words + 1):
             candidate = ' '.join(words[i:i + span_words])
-            ratio = SequenceMatcher(None, source_span.lower(), candidate.lower()).ratio()
+            ratio = SequenceMatcher(None, normalized_span.lower(), candidate.lower()).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_match = candidate
 
         if best_ratio < similarity_threshold:
-            issues.append(f"Source span not found in text: '{source_span}'")
+            issues.append(f"Source span not found in text: '{normalized_span}'")
             if best_match:
                 suggestions.append(f"Did you mean: '{best_match}' (similarity: {best_ratio:.2f})?")
         else:
             suggestions.append(f"Fuzzy match found: '{best_match}' (similarity: {best_ratio:.2f})")
 
-    # Check 2: Entity derivable from source span
-    entity_lower = extracted_entity.lower()
-    span_lower = source_span.lower()
+    # Check 2: Entity derivable from source span (use normalized versions)
+    entity_lower = _normalize_whitespace(extracted_entity).lower()
+    span_lower = normalized_span.lower()
 
     if entity_lower not in span_lower and span_lower not in entity_lower:
         # Check for abbreviation relationship
         if not _is_abbreviation(extracted_entity, source_span):
-            issues.append(f"Entity '{extracted_entity}' not derivable from span '{source_span}'")
+            issues.append(f"Entity '{extracted_entity}' not derivable from span '{normalized_span}'")
 
     # Check 3: Entity type plausibility (basic heuristics)
     if entity_type == 'GENE':
