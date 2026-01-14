@@ -52,6 +52,46 @@ class Config:
     CHUNK_MAX_SIZE: int = 4000  # chars - only used as fallback for huge sections
     CHUNK_MIN_SIZE: int = 50   # chars - skip empty sections
 
+    # ==========================================================================
+    # Domain-Specific Entity Schema (from GraphRAG paper findings)
+    # Paper: "GraphRAG on Technical Documents – Impact of Knowledge Graph Schema"
+    # DOI: 10.4230/TGDK.3.2.3
+    #
+    # Key insight: Domain-expert schemas extract 10% more relevant entities
+    # than generic auto-generated schemas. Simple 5-class schemas outperform
+    # complex auto-schemas on technical documents.
+    # ==========================================================================
+
+    SPATIAL_TX_ENTITY_TYPES: tuple = (
+        'METHOD',           # Img2ST, TESLA, Tangram, HisToGene
+        'DATASET',          # Visium HD, 10x Xenium, MERSCOPE
+        'CELL_TYPE',        # T-cell, macrophage, fibroblast
+        'GENE',             # EGFR, TP53, BRCA1
+        'TISSUE',           # colon, liver, brain
+        'ALGORITHM',        # optimal transport, diffusion, GNN
+        'LOSS_FUNCTION',    # MSE, Poisson NLL, ZINB
+        'DATA_STRUCTURE',   # point cloud, graph, tensor
+        'METRIC',           # PCC, SSIM, AUC, R²
+        'MECHANISM',        # attention, convolution, transformer
+    )
+
+    SPATIAL_TX_RELATION_TYPES: tuple = (
+        'APPLIES_TO',       # method → dataset
+        'PREDICTS',         # method → gene expression
+        'OUTPERFORMS',      # method → method (with metric context)
+        'REQUIRES',         # method → data_structure
+        'TRAINED_ON',       # method → dataset
+        'OPERATES_ON',      # algorithm → data_structure
+        'EXPRESSES',        # cell_type → gene
+        'FOUND_IN',         # cell_type → tissue
+        'USES_LOSS',        # method → loss_function
+        'IMPLEMENTS',       # method → mechanism
+    )
+
+    # Confidence thresholds for entity extraction
+    ENTITY_CONFIDENCE_THRESHOLD: float = 0.7
+    RELATION_CONFIDENCE_THRESHOLD: float = 0.6
+
     def validate(self) -> list[str]:
         """Validate configuration. Returns list of errors."""
         errors = []
